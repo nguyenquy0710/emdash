@@ -8,11 +8,8 @@ RUN pnpm run build
 FROM node:22-alpine AS runtime
 RUN npm install -g pnpm
 WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/packages ./packages
-COPY --from=build /app/package.json ./
-COPY --from=build /app/pnpm-workspace.yaml ./
-COPY --from=build /app/pnpm-lock.yaml ./
+COPY --from=build /app ./
+RUN pnpm install --frozen-lockfile
 
 EXPOSE 4321
 CMD ["pnpm", "emdash", "dev"]
