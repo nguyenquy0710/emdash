@@ -8,11 +8,41 @@
  * - Marketplace ingest extends this with publishing-specific fields
  */
 
+import {
+	capabilitiesToDeclaredAccess,
+	declaredAccessToCapabilities,
+} from "@emdash-cms/plugin-types";
 import { z } from "zod";
+
+import type { PluginManifest } from "./types.js";
 
 // ── Enum values (must stay in sync with types.ts) ───────────────
 
-export const PLUGIN_CAPABILITIES = [
+/**
+ * Current capability names — the ones authors should use going forward.
+ * See `PluginCapability` in `types.ts` for documentation of each.
+ */
+export const CURRENT_PLUGIN_CAPABILITIES = [
+	"network:request",
+	"network:request:unrestricted",
+	"content:read",
+	"content:write",
+	"media:read",
+	"media:write",
+	"users:read",
+	"email:send",
+	"hooks.email-transport:register",
+	"hooks.email-events:register",
+	"hooks.page-fragments:register",
+] as const;
+
+/**
+ * Legacy capability names accepted during the deprecation window.
+ * Normalized to current names via `normalizeCapability()` in types.ts
+ * before reaching the runtime. Plugin authors are warned at bundle/validate
+ * and hard-failed at publish.
+ */
+export const DEPRECATED_PLUGIN_CAPABILITIES = [
 	"network:fetch",
 	"network:fetch:any",
 	"read:content",
@@ -20,10 +50,21 @@ export const PLUGIN_CAPABILITIES = [
 	"read:media",
 	"write:media",
 	"read:users",
-	"email:send",
 	"email:provide",
 	"email:intercept",
 	"page:inject",
+] as const;
+
+/**
+ * Full set of accepted capability strings — current + deprecated.
+ *
+ * The manifest schema accepts both during the transition. The runtime only
+ * ever sees current names because `normalizeCapability()` rewrites legacy
+ * names at every external boundary (definePlugin, adaptSandboxEntry).
+ */
+export const PLUGIN_CAPABILITIES = [
+	...CURRENT_PLUGIN_CAPABILITIES,
+	...DEPRECATED_PLUGIN_CAPABILITIES,
 ] as const;
 
 /** Must stay in sync with FieldType in schema/types.ts */
@@ -42,6 +83,7 @@ const FIELD_TYPES = [
 	"reference",
 	"json",
 	"slug",
+	"repeater",
 ] as const;
 
 export const HOOK_NAMES = [
@@ -53,6 +95,8 @@ export const HOOK_NAMES = [
 	"content:afterSave",
 	"content:beforeDelete",
 	"content:afterDelete",
+	"content:afterPublish",
+	"content:afterUnpublish",
 	"media:beforeUpload",
 	"media:afterUpload",
 	"cron",
@@ -128,6 +172,18 @@ const settingFieldSchema = z.discriminatedUnion("type", [
 		default: z.string().optional(),
 	}),
 	z.object({ ...baseSettingFields, type: z.literal("secret") }),
+	z.object({
+		...baseSettingFields,
+		type: z.literal("url"),
+		default: z.string().optional(),
+		placeholder: z.string().optional(),
+	}),
+	z.object({
+		...baseSettingFields,
+		type: z.literal("email"),
+		default: z.string().optional(),
+		placeholder: z.string().optional(),
+	}),
 ]);
 
 const adminPageSchema = z.object({
@@ -169,16 +225,63 @@ const pluginAdminConfigSchema = z.object({
 		.optional(),
 });
 
+// ── declaredAccess ──────────────────────────────────────────────
+
+/**
+ * An operation's constraint object. Open vocabulary: keys the runtime
+ * recognises are enforced, others are advisory. The bundler emits `{}` for a
+ * granted operation; presence (not value) signals the grant.
+ */
+const accessConstraints = z.record(z.string(), z.unknown());
+
+/**
+ * Structured trust contract embedded in the bundle manifest. Mirrors
+ * `DeclaredAccess` in `@emdash-cms/plugin-types`. Categories are host
+ * subsystems; operations are modes of participation.
+ */
+const declaredAccessSchema = z.object({
+	content: z
+		.object({ read: accessConstraints.optional(), write: accessConstraints.optional() })
+		.optional(),
+	media: z
+		.object({ read: accessConstraints.optional(), write: accessConstraints.optional() })
+		.optional(),
+	network: z
+		.object({
+			// allowedHosts: absent = unrestricted; present = host-restricted. Reject
+			// an empty array (which the decoder would otherwise have to treat as
+			// deny-all) to match the record lexicon's `minLength: 1` and keep the
+			// "absent vs empty" distinction from ever reaching enforcement ambiguous.
+			request: z.object({ allowedHosts: z.array(z.string()).min(1).optional() }).optional(),
+		})
+		.optional(),
+	email: z
+		.object({
+			send: accessConstraints.optional(),
+			events: accessConstraints.optional(),
+			transport: accessConstraints.optional(),
+		})
+		.optional(),
+	page: z.object({ fragments: accessConstraints.optional() }).optional(),
+	users: z.object({ read: accessConstraints.optional() }).optional(),
+});
+
 // ── Main schema ─────────────────────────────────────────────────
 
 /**
  * Zod schema matching the PluginManifest interface from types.ts.
  *
  * Every JSON.parse of a manifest.json should validate through this.
+ *
+ * `declaredAccess` is the trust contract; `capabilities`/`allowedHosts` are the
+ * runtime's enforcement currency. Apply `reconcileManifestAccess` after parsing
+ * to make them consistent (declaredAccess authoritative when present). Kept a
+ * plain object (no `.transform`) because callers `.pick()`/`.extend()` it.
  */
 export const pluginManifestSchema = z.object({
 	id: z.string().min(1),
 	version: z.string().min(1),
+	declaredAccess: declaredAccessSchema.optional(),
 	capabilities: z.array(z.enum(PLUGIN_CAPABILITIES)),
 	allowedHosts: z.array(z.string()),
 	storage: z.record(z.string(), storageCollectionSchema),
@@ -203,6 +306,28 @@ export const pluginManifestSchema = z.object({
 });
 
 export type ValidatedPluginManifest = z.infer<typeof pluginManifestSchema>;
+
+/**
+ * Reconcile a parsed manifest's trust contract with its enforcement currency.
+ * `declaredAccess` is authoritative: when present, `capabilities`/`allowedHosts`
+ * are re-derived from it so what the runtime enforces always matches what was
+ * recorded and consented to. A pre-migration bundle without `declaredAccess`
+ * has it derived from the legacy capability list instead. The result always
+ * carries both, mutually consistent. Apply this at every bundle-parse site.
+ */
+export function reconcileManifestAccess(manifest: ValidatedPluginManifest): PluginManifest {
+	const reconciled: ValidatedPluginManifest = manifest.declaredAccess
+		? { ...manifest, ...declaredAccessToCapabilities(manifest.declaredAccess) }
+		: {
+				...manifest,
+				declaredAccess: capabilitiesToDeclaredAccess(manifest.capabilities, manifest.allowedHosts),
+			};
+	// Block Kit admin elements are typed as `unknown` by the Zod schema (their
+	// Element shape is validated at render time), so the validated manifest
+	// needs a structural cast up to the runtime PluginManifest.
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- admin elements are unknown[] in Zod; Element type checked at render time
+	return reconciled as unknown as PluginManifest;
+}
 
 /**
  * Normalize a manifest hook entry — plain strings become `{ name }` objects.

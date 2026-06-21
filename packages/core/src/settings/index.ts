@@ -7,15 +7,61 @@
 
 import type { Kysely } from "kysely";
 
+import { after } from "../after.js";
 import { MediaRepository } from "../database/repositories/media.js";
 import { OptionsRepository } from "../database/repositories/options.js";
 import type { Database } from "../database/types.js";
 import { getDb } from "../loader.js";
+import { peekRequestCache, requestCached } from "../request-cache.js";
 import type { Storage } from "../storage/types.js";
-import type { SiteSettings, SiteSettingKey, MediaReference } from "./types.js";
+import {
+	createSingleFlightCache,
+	type SingleFlightCache,
+	invalidateSingleFlightCache,
+	singleFlightCached,
+} from "../utils/single-flight-cache.js";
+import type { SiteSettings, SiteSettingKey, MediaReference, SeoSettings } from "./types.js";
 
 /** Prefix for site settings in the options table */
 const SETTINGS_PREFIX = "site:";
+
+/**
+ * Worker-isolate cache for the resolved `site:*` settings.
+ *
+ * Site settings (title, logo, SEO defaults) change rarely but are read on
+ * every public request. Caching across the isolate's lifetime drops the
+ * `options WHERE name LIKE 'site:%'` prefix scan from once-per-request to
+ * once-per-isolate. Cross-isolate staleness is bounded by isolate lifetime
+ * (workerd typically recycles within minutes); acceptable for chrome.
+ *
+ * Backed by single-flight-cache.ts: concurrent cold reads coalesce onto one
+ * query via a reclaimable single-flight lock and the resolved *value* is
+ * cached — never a shared in-flight promise, so a cancelled request can't
+ * poison the isolate (see that file's header). Stored on globalThis with a
+ * Symbol.for key so Vite SSR chunk duplication doesn't produce two
+ * independent caches (same pattern as request-context.ts).
+ */
+const SITE_SETTINGS_CACHE_KEY = Symbol.for("emdash:site-settings");
+const g = globalThis as Record<symbol, unknown>;
+const settingsCache: SingleFlightCache<Partial<SiteSettings>> =
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- globalThis singleton pattern (see request-context.ts)
+	(g[SITE_SETTINGS_CACHE_KEY] as SingleFlightCache<Partial<SiteSettings>> | undefined) ??
+	(() => {
+		const c = createSingleFlightCache<Partial<SiteSettings>>();
+		g[SITE_SETTINGS_CACHE_KEY] = c;
+		return c;
+	})();
+
+/**
+ * Bump the isolate-wide site-settings cache version, forcing the next
+ * `getSiteSettings()` to re-query the database.
+ *
+ * Called from every `site:*` write path. Other isolates still serve their
+ * own cached copy until they expire — staleness bounded by isolate lifetime.
+ */
+export function invalidateSiteSettingsCache(): void {
+	invalidateSingleFlightCache(settingsCache);
+}
 
 /**
  * Type guard for MediaReference values
@@ -25,13 +71,18 @@ function isMediaReference(value: unknown): value is MediaReference {
 }
 
 /**
- * Resolve a media reference to include the full URL
+ * Resolve a media reference to include the full URL plus content metadata.
+ *
+ * Pulls `mimeType` and intrinsic dimensions from the media row so callers
+ * can emit correct head tags (e.g. `<link rel="icon" type="image/svg+xml">`,
+ * which Chromium requires when the URL has no `.svg` extension) without
+ * a second round-trip to the media table.
  */
 async function resolveMediaReference(
 	mediaRef: MediaReference | undefined,
 	db: Kysely<Database>,
 	_storage: Storage | null,
-): Promise<(MediaReference & { url?: string }) | undefined> {
+): Promise<MediaReference | undefined> {
 	if (!mediaRef?.mediaId) {
 		return mediaRef;
 	}
@@ -45,6 +96,9 @@ async function resolveMediaReference(
 			return {
 				...mediaRef,
 				url: `/_emdash/api/media/file/${media.storageKey}`,
+				contentType: media.mimeType,
+				...(media.width !== null ? { width: media.width } : {}),
+				...(media.height !== null ? { height: media.height } : {}),
 			};
 		}
 	} catch {
@@ -75,8 +129,24 @@ async function resolveMediaReference(
 export async function getSiteSetting<K extends SiteSettingKey>(
 	key: K,
 ): Promise<SiteSettings[K] | undefined> {
-	const db = await getDb();
-	return getSiteSettingWithDb(key, db);
+	// If `getSiteSettings()` has already been called in this request,
+	// read from that (request-cached) batch rather than firing a second
+	// options-table query. Common layout: a Base template pulls the
+	// whole settings object up-front, then `EmDashHead` or a plugin
+	// asks for one key — no reason the singular call should round-trip
+	// again.
+	const primed = peekRequestCache<Partial<SiteSettings>>("siteSettings");
+	if (primed) {
+		const settings = await primed;
+		return settings[key];
+	}
+
+	// Otherwise cache per-key. Templates that pull several settings
+	// independently still share the in-flight query for each one.
+	return requestCached(`siteSetting:${key}`, async () => {
+		const db = await getDb();
+		return getSiteSettingWithDb(key, db);
+	});
 }
 
 /**
@@ -102,8 +172,21 @@ export async function getSiteSettingWithDb<K extends SiteSettingKey>(
 	// We use the non-generic getSiteSettingsWithDb for media resolution instead.
 	if ((key === "logo" || key === "favicon") && isMediaReference(value)) {
 		const resolved = await resolveMediaReference(value, db, storage);
-		// eslint-disable-next-line typescript-eslint(no-unsafe-type-assertion) -- TS can't narrow generic K from key equality; resolved type is correct
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- TS can't narrow generic K from key equality; resolved type is correct
 		return resolved as SiteSettings[K] | undefined;
+	}
+
+	if (key === "seo" && value && typeof value === "object") {
+		// eslint-disable-next-line typescript/no-unsafe-type-assertion -- TS can't narrow generic K from key equality
+		const seo = value as SeoSettings;
+		if (seo.defaultOgImage) {
+			const resolved = {
+				...seo,
+				defaultOgImage: await resolveMediaReference(seo.defaultOgImage, db, storage),
+			};
+			// eslint-disable-next-line typescript/no-unsafe-type-assertion -- TS can't narrow generic K from key equality
+			return resolved as SiteSettings[K] | undefined;
+		}
 	}
 
 	return value;
@@ -124,9 +207,20 @@ export async function getSiteSettingWithDb<K extends SiteSettingKey>(
  * console.log(settings.logo?.url); // "/_emdash/api/media/file/abc123"
  * ```
  */
-export async function getSiteSettings(): Promise<Partial<SiteSettings>> {
-	const db = await getDb();
-	return getSiteSettingsWithDb(db);
+export function getSiteSettings(): Promise<Partial<SiteSettings>> {
+	// requestCached dedupes within a single request; singleFlightCached
+	// coalesces across requests and caches the resolved value for the
+	// global scope's lifetime without ever sharing an awaitable promise.
+	return requestCached("siteSettings", () =>
+		singleFlightCached(
+			settingsCache,
+			async () => {
+				const db = await getDb();
+				return getSiteSettingsWithDb(db);
+			},
+			{ anchor: (promise) => after(() => promise), ownerTimeoutMs: 30_000 },
+		),
+	);
 }
 
 /**
@@ -158,6 +252,12 @@ export async function getSiteSettingsWithDb(
 	}
 	if (typedSettings.favicon) {
 		typedSettings.favicon = await resolveMediaReference(typedSettings.favicon, db, storage);
+	}
+	if (typedSettings.seo?.defaultOgImage) {
+		typedSettings.seo = {
+			...typedSettings.seo,
+			defaultOgImage: await resolveMediaReference(typedSettings.seo.defaultOgImage, db, storage),
+		};
 	}
 
 	return typedSettings;
@@ -199,5 +299,73 @@ export async function setSiteSettings(
 		}
 	}
 
-	await options.setMany(updates);
+	try {
+		await options.setMany(updates);
+	} finally {
+		invalidateSiteSettingsCache();
+	}
+}
+
+/**
+ * Get a single plugin setting by key.
+ *
+ * Plugin settings are stored in the options table under
+ * `plugin:<pluginId>:settings:<key>`.
+ */
+export async function getPluginSetting<T = unknown>(
+	pluginId: string,
+	key: string,
+): Promise<T | undefined> {
+	const db = await getDb();
+	return getPluginSettingWithDb<T>(pluginId, key, db);
+}
+
+/**
+ * Get a single plugin setting by key (with explicit db).
+ *
+ * @internal Use `getPluginSetting()` in templates and plugin rendering code.
+ */
+export async function getPluginSettingWithDb<T = unknown>(
+	pluginId: string,
+	key: string,
+	db: Kysely<Database>,
+): Promise<T | undefined> {
+	const options = new OptionsRepository(db);
+	const value = await options.get<T>(`plugin:${pluginId}:settings:${key}`);
+	return value ?? undefined;
+}
+
+/**
+ * Get all persisted plugin settings for a plugin.
+ *
+ * Defaults declared in `admin.settingsSchema` are not materialized
+ * automatically; callers should apply their own fallback defaults.
+ */
+export async function getPluginSettings(pluginId: string): Promise<Record<string, unknown>> {
+	const db = await getDb();
+	return getPluginSettingsWithDb(pluginId, db);
+}
+
+/**
+ * Get all persisted plugin settings for a plugin (with explicit db).
+ *
+ * @internal Use `getPluginSettings()` in templates and plugin rendering code.
+ */
+export async function getPluginSettingsWithDb(
+	pluginId: string,
+	db: Kysely<Database>,
+): Promise<Record<string, unknown>> {
+	const prefix = `plugin:${pluginId}:settings:`;
+	const options = new OptionsRepository(db);
+	const allOptions = await options.getByPrefix(prefix);
+
+	const settings: Record<string, unknown> = {};
+	for (const [key, value] of allOptions) {
+		if (!key.startsWith(prefix)) {
+			continue;
+		}
+		settings[key.slice(prefix.length)] = value;
+	}
+
+	return settings;
 }

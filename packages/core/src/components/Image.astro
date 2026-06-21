@@ -5,10 +5,16 @@
  * Renders image blocks from WordPress imports and EmDash media.
  * Uses the provider's getSrc function for responsive srcset generation.
  */
+import { getImage } from "astro:assets";
 import type { ImageEmbed } from "../media/types.js";
 import { getMediaProvider } from "../media/provider-loader.js";
-// Standard responsive breakpoints
-const BREAKPOINTS = [640, 750, 828, 960, 1080, 1280, 1600, 1920];
+import { buildRenderMediaUrl } from "../media/url.js";
+import {
+	buildResponsiveImage,
+	toAbsoluteMediaUrl,
+	RESPONSIVE_BREAKPOINTS,
+} from "../media/responsive.js";
+import { getPublicOrigin } from "../api/public-url.js";
 
 export interface Props {
 	node: {
@@ -43,7 +49,7 @@ function generateSrcset(
 	maxWidth: number,
 	aspectRatio?: number,
 ): string {
-	return BREAKPOINTS.filter((w) => w <= maxWidth * 2)
+	return RESPONSIVE_BREAKPOINTS.filter((w) => w <= maxWidth * 2)
 		.map((w) => {
 			const h = aspectRatio ? Math.round(w / aspectRatio) : undefined;
 			return `${getSrc({ width: w, height: h })} ${w}w`;
@@ -122,10 +128,26 @@ if (providerId && providerId !== "local") {
 	}
 }
 
-// Fallback for local provider — prefer stored URL (includes storage key with extension),
-// fall back to _ref (bare ULID, works if media file endpoint supports ID lookup)
+// Fallback for local provider. `asset.url` carries the storage key with
+// extension when present; `asset._ref` is a bare ULID that only the internal
+// `/file/{id}` route can resolve. `buildRenderMediaUrl` picks the right shape.
 if (!src) {
-	src = asset.url || `/_emdash/api/media/file/${asset._ref}`;
+	src = buildRenderMediaUrl(Astro.locals.emdash?.getPublicMediaUrl, {
+		url: asset.url,
+		id: asset._ref,
+	});
+	// Generate a responsive srcset via Astro's image service for local/R2 media.
+	// Falls back to the plain URL when optimization isn't possible.
+	const optimized = await buildResponsiveImage(getImage, {
+		src: toAbsoluteMediaUrl(src, getPublicOrigin(Astro.url, Astro.locals.emdash?.config)),
+		width: renderWidth,
+		height: renderHeight,
+	});
+	if (optimized) {
+		src = optimized.src;
+		srcset = optimized.srcset;
+		sizes = optimized.sizes;
+	}
 }
 
 // Build placeholder background style
@@ -171,7 +193,7 @@ const imgStyle = placeholderStyle ? `${baseStyle} ${placeholderStyle}` : baseSty
 	}
 	.emdash-image figcaption {
 		font-size: 0.875rem;
-		color: #666;
+		color: var(--emdash-caption-color, var(--color-muted, #666));
 		margin-top: 0.5rem;
 		text-align: center;
 	}

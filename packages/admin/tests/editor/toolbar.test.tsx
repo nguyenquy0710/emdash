@@ -1,12 +1,12 @@
 import type { Editor } from "@tiptap/core";
 import { userEvent } from "@vitest/browser/context";
 import { describe, it, expect, vi } from "vitest";
-import { render } from "vitest-browser-react";
 
 import {
 	PortableTextEditor,
 	type PortableTextEditorProps,
 } from "../../src/components/PortableTextEditor";
+import { render } from "../utils/render.tsx";
 
 // ---------------------------------------------------------------------------
 // Mocks — heavy components that need network / Astro context
@@ -123,6 +123,19 @@ async function focusAndSelectAll(screen: Awaited<ReturnType<typeof render>>) {
 	await userEvent.keyboard(`${mod}{a}${modUp}`);
 }
 
+/**
+ * Returns a locator scoped to the editor toolbar.
+ *
+ * The bubble menu (which appears when text is selected) renders buttons with
+ * the same accessible names as some toolbar buttons (Bold, Italic, Underline,
+ * Strikethrough). An unscoped `getByRole("button", { name: "Bold" })` after
+ * selecting text races with the bubble menu and produces a strict-mode
+ * violation in CI. Scoping to the toolbar via its aria-label avoids the race.
+ */
+function getToolbarButton(screen: Awaited<ReturnType<typeof render>>, name: string) {
+	return screen.getByRole("toolbar", { name: "Text formatting" }).getByRole("button", { name });
+}
+
 // =============================================================================
 // 1. Toolbar Presence and Structure
 // =============================================================================
@@ -173,6 +186,7 @@ describe("Toolbar Presence and Structure", () => {
 		const { screen } = await renderEditor();
 		await expect.element(screen.getByRole("button", { name: "Insert Link" })).toBeVisible();
 		await expect.element(screen.getByRole("button", { name: "Insert Image" })).toBeVisible();
+		await expect.element(screen.getByRole("button", { name: "Insert HTML" })).toBeVisible();
 		await expect
 			.element(screen.getByRole("button", { name: "Insert Horizontal Rule" }))
 			.toBeVisible();
@@ -205,7 +219,7 @@ describe("Formatting Button Toggle States", () => {
 		const { screen } = await renderEditor();
 		await focusAndSelectAll(screen);
 
-		const btn = screen.getByRole("button", { name: "Bold" });
+		const btn = getToolbarButton(screen, "Bold");
 		await expect.element(btn).toHaveAttribute("aria-pressed", "false");
 		btn.element().click();
 
@@ -218,7 +232,7 @@ describe("Formatting Button Toggle States", () => {
 		const { screen } = await renderEditor();
 		await focusAndSelectAll(screen);
 
-		const btn = screen.getByRole("button", { name: "Italic" });
+		const btn = getToolbarButton(screen, "Italic");
 		await expect.element(btn).toHaveAttribute("aria-pressed", "false");
 		btn.element().click();
 
@@ -231,7 +245,7 @@ describe("Formatting Button Toggle States", () => {
 		const { screen } = await renderEditor();
 		await focusAndSelectAll(screen);
 
-		const btn = screen.getByRole("button", { name: "Underline" });
+		const btn = getToolbarButton(screen, "Underline");
 		await expect.element(btn).toHaveAttribute("aria-pressed", "false");
 		btn.element().click();
 
@@ -244,7 +258,7 @@ describe("Formatting Button Toggle States", () => {
 		const { screen } = await renderEditor();
 		await focusAndSelectAll(screen);
 
-		const btn = screen.getByRole("button", { name: "Strikethrough" });
+		const btn = getToolbarButton(screen, "Strikethrough");
 		await expect.element(btn).toHaveAttribute("aria-pressed", "false");
 		btn.element().click();
 
@@ -257,7 +271,7 @@ describe("Formatting Button Toggle States", () => {
 		const { screen } = await renderEditor();
 		await focusAndSelectAll(screen);
 
-		const btn = screen.getByRole("button", { name: "Inline Code" });
+		const btn = getToolbarButton(screen, "Inline Code");
 		await expect.element(btn).toHaveAttribute("aria-pressed", "false");
 		btn.element().click();
 
@@ -357,7 +371,7 @@ describe("Formatting Button Toggle States", () => {
 		const { screen } = await renderEditor();
 		await focusAndSelectAll(screen);
 
-		const btn = screen.getByRole("button", { name: "Bold" });
+		const btn = getToolbarButton(screen, "Bold");
 
 		// First click: on
 		btn.element().click();
@@ -452,9 +466,9 @@ describe("Undo/Redo", () => {
 		await focusAndSelectAll(screen);
 
 		// Make a change - toggle bold
-		screen.getByRole("button", { name: "Bold" }).element().click();
+		getToolbarButton(screen, "Bold").element().click();
 
-		const undo = screen.getByRole("button", { name: "Undo" });
+		const undo = getToolbarButton(screen, "Undo");
 		await vi.waitFor(
 			() => {
 				expect(undo.element().disabled).toBe(false);
@@ -468,10 +482,10 @@ describe("Undo/Redo", () => {
 		await focusAndSelectAll(screen);
 
 		// Make a change
-		screen.getByRole("button", { name: "Bold" }).element().click();
+		getToolbarButton(screen, "Bold").element().click();
 
-		const undo = screen.getByRole("button", { name: "Undo" });
-		const redo = screen.getByRole("button", { name: "Redo" });
+		const undo = getToolbarButton(screen, "Undo");
+		const redo = getToolbarButton(screen, "Redo");
 
 		// Wait for undo to be enabled, then click it
 		await vi.waitFor(
@@ -495,10 +509,10 @@ describe("Undo/Redo", () => {
 		await focusAndSelectAll(screen);
 
 		// Make a change
-		screen.getByRole("button", { name: "Bold" }).element().click();
+		getToolbarButton(screen, "Bold").element().click();
 
-		const undo = screen.getByRole("button", { name: "Undo" });
-		const redo = screen.getByRole("button", { name: "Redo" });
+		const undo = getToolbarButton(screen, "Undo");
+		const redo = getToolbarButton(screen, "Redo");
 
 		// Undo
 		await vi.waitFor(
@@ -529,7 +543,26 @@ describe("Undo/Redo", () => {
 });
 
 // =============================================================================
-// 5. Link Insertion (Toolbar Popover)
+// 5. HTML Block Insertion
+// =============================================================================
+
+describe("HTML Block Insertion", () => {
+	it("clicking Insert HTML inserts an empty HTML block", async () => {
+		const { screen, editor } = await renderEditor();
+		editor.commands.focus("end");
+
+		getToolbarButton(screen, "Insert HTML").element().click();
+
+		await vi.waitFor(() => {
+			const htmlBlock = editor.getJSON().content?.find((node) => node.type === "htmlBlock");
+			expect(htmlBlock).toBeDefined();
+			expect((htmlBlock as { attrs?: { html?: string } }).attrs?.html).toBe("");
+		});
+	});
+});
+
+// =============================================================================
+// 6. Link Insertion (Toolbar Popover)
 // =============================================================================
 
 describe("Link Insertion", () => {
@@ -629,7 +662,7 @@ describe("Link Insertion", () => {
 });
 
 // =============================================================================
-// 6. Focus Mode Toggle
+// 7. Focus Mode Toggle
 // =============================================================================
 
 describe("Focus Mode Toggle", () => {
@@ -699,7 +732,7 @@ describe("Focus Mode Toggle", () => {
 });
 
 // =============================================================================
-// 7. WAI-ARIA Keyboard Navigation
+// 8. WAI-ARIA Keyboard Navigation
 // =============================================================================
 
 describe("WAI-ARIA Keyboard Navigation", () => {

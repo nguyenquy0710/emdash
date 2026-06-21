@@ -3,6 +3,7 @@ import { ulid } from "ulidx";
 
 import { slugify } from "../../utils/slugify.js";
 import type { Database } from "../types.js";
+import { validateIdentifier } from "../validate.js";
 import { RevisionRepository } from "./revision.js";
 import type {
 	CreateContentInput,
@@ -10,11 +11,32 @@ import type {
 	FindManyOptions,
 	FindManyResult,
 	ContentItem,
+	ContentDateField,
 } from "./types.js";
-import { EmDashValidationError, encodeCursor, decodeCursor } from "./types.js";
+import {
+	EmDashValidationError,
+	ScheduledNotDueError,
+	encodeCursor,
+	decodeCursor,
+} from "./types.js";
 
 // Regex pattern for ULID validation
 const ULID_PATTERN = /^[0-9A-Z]{26}$/;
+
+// LIKE wildcards that must be escaped so user search input is matched literally.
+const LIKE_WILDCARD_RE = /[\\%_]/g;
+
+/**
+ * Whitelist mapping a public date-filter field to its physical column. Keeping
+ * this separate from `mapOrderField` makes the filterable set explicit and
+ * prevents filtering on arbitrary columns.
+ */
+const DATE_FILTER_COLUMNS: Record<ContentDateField, "created_at" | "updated_at" | "published_at"> =
+	{
+		createdAt: "created_at",
+		updatedAt: "updated_at",
+		publishedAt: "published_at",
+	};
 
 /**
  * System columns that exist in every ec_* table
@@ -41,6 +63,7 @@ const SYSTEM_COLUMNS = new Set([
  * Get the table name for a collection type
  */
 function getTableName(type: string): string {
+	validateIdentifier(type, "collection type");
 	return `ec_${type}`;
 }
 
@@ -116,6 +139,7 @@ export class ContentRepository {
 			locale,
 			translationOf,
 			publishedAt,
+			createdAt,
 		} = input;
 
 		// Validate required fields
@@ -155,7 +179,7 @@ export class ContentRepository {
 			status,
 			authorId || null,
 			primaryBylineId ?? null,
-			now,
+			createdAt || now,
 			now,
 			publishedAt || null,
 			1,
@@ -167,6 +191,7 @@ export class ContentRepository {
 		if (data && typeof data === "object") {
 			for (const [key, value] of Object.entries(data)) {
 				if (!SYSTEM_COLUMNS.has(key)) {
+					validateIdentifier(key, "content field name");
 					columns.push(key);
 					values.push(serializeValue(value));
 				}
@@ -485,27 +510,29 @@ export class ContentRepository {
 			query = query.where("locale" as any, "=", options.where.locale);
 		}
 
-		// Handle cursor pagination
-		if (options.cursor) {
-			const decoded = decodeCursor(options.cursor);
-			if (decoded) {
-				const { orderValue, id: cursorId } = decoded;
+		query = this.applySearchFilter(query, options.where);
+		query = this.applyDateFilter(query, options.where);
 
-				if (safeOrderDirection === "DESC") {
-					query = query.where((eb) =>
-						eb.or([
-							eb(dbField as any, "<", orderValue),
-							eb.and([eb(dbField as any, "=", orderValue), eb("id", "<", cursorId)]),
-						]),
-					);
-				} else {
-					query = query.where((eb) =>
-						eb.or([
-							eb(dbField as any, ">", orderValue),
-							eb.and([eb(dbField as any, "=", orderValue), eb("id", ">", cursorId)]),
-						]),
-					);
-				}
+		// Handle cursor pagination — decodeCursor throws InvalidCursorError
+		// on malformed input; let it propagate so handlers surface a
+		// structured INVALID_CURSOR rather than silently returning page 1.
+		if (options.cursor) {
+			const { orderValue, id: cursorId } = decodeCursor(options.cursor);
+
+			if (safeOrderDirection === "DESC") {
+				query = query.where((eb) =>
+					eb.or([
+						eb(dbField as any, "<", orderValue),
+						eb.and([eb(dbField as any, "=", orderValue), eb("id", "<", cursorId)]),
+					]),
+				);
+			} else {
+				query = query.where((eb) =>
+					eb.or([
+						eb(dbField as any, ">", orderValue),
+						eb.and([eb(dbField as any, "=", orderValue), eb("id", ">", cursorId)]),
+					]),
+				);
 			}
 		}
 
@@ -515,12 +542,16 @@ export class ContentRepository {
 			.orderBy("id", safeOrderDirection === "ASC" ? "asc" : "desc")
 			.limit(limit + 1);
 
-		const rows = await query.execute();
+		// Run the page fetch and the unbounded count together — the UI needs
+		// both to render a stable denominator (kept on every page intentionally),
+		// and issuing them in parallel on SQLite is essentially free.
+		const [rows, total] = await Promise.all([query.execute(), this.count(type, options.where)]);
 		const hasMore = rows.length > limit;
 		const items = rows.slice(0, limit);
 
 		const mappedResult: FindManyResult<ContentItem> = {
 			items: items.map((row) => this.mapRow(type, row as Record<string, unknown>)),
+			total,
 		};
 
 		if (hasMore && items.length > 0) {
@@ -577,6 +608,7 @@ export class ContentRepository {
 		if (input.data !== undefined && typeof input.data === "object") {
 			for (const [key, value] of Object.entries(input.data)) {
 				if (!SYSTEM_COLUMNS.has(key)) {
+					validateIdentifier(key, "content field name");
 					updates[key] = serializeValue(value);
 				}
 			}
@@ -633,12 +665,23 @@ export class ContentRepository {
 	/**
 	 * Permanently delete content (cannot be undone)
 	 */
+	/**
+	 * Permanently delete a soft-deleted content row.
+	 *
+	 * Returns `true` only when a soft-deleted (trashed) row was removed.
+	 * Returns `false` when no row exists OR when the row exists but is live —
+	 * the caller is responsible for distinguishing these cases (typically via
+	 * a follow-up `findByIdOrSlugIncludingTrashed` to surface NOT_FOUND vs
+	 * NOT_TRASHED). The `AND deleted_at IS NOT NULL` clause is the safety net
+	 * that prevents permanent delete from bypassing the trash workflow.
+	 */
 	async permanentDelete(type: string, id: string): Promise<boolean> {
 		const tableName = getTableName(type);
 
 		const result = await sql`
 			DELETE FROM ${sql.ref(tableName)}
 			WHERE id = ${id}
+			AND deleted_at IS NOT NULL
 		`.execute(this.db);
 
 		return (result.numAffectedRows ?? 0n) > 0n;
@@ -666,27 +709,24 @@ export class ContentRepository {
 			.selectAll()
 			.where("deleted_at" as never, "is not", null);
 
-		// Handle cursor pagination
+		// Handle cursor pagination — decodeCursor throws on invalid input.
 		if (options.cursor) {
-			const decoded = decodeCursor(options.cursor);
-			if (decoded) {
-				const { orderValue, id: cursorId } = decoded;
+			const { orderValue, id: cursorId } = decodeCursor(options.cursor);
 
-				if (safeOrderDirection === "DESC") {
-					query = query.where((eb) =>
-						eb.or([
-							eb(dbField as any, "<", orderValue),
-							eb.and([eb(dbField as any, "=", orderValue), eb("id", "<", cursorId)]),
-						]),
-					);
-				} else {
-					query = query.where((eb) =>
-						eb.or([
-							eb(dbField as any, ">", orderValue),
-							eb.and([eb(dbField as any, "=", orderValue), eb("id", ">", cursorId)]),
-						]),
-					);
-				}
+			if (safeOrderDirection === "DESC") {
+				query = query.where((eb) =>
+					eb.or([
+						eb(dbField as any, "<", orderValue),
+						eb.and([eb(dbField as any, "=", orderValue), eb("id", "<", cursorId)]),
+					]),
+				);
+			} else {
+				query = query.where((eb) =>
+					eb.or([
+						eb(dbField as any, ">", orderValue),
+						eb.and([eb(dbField as any, "=", orderValue), eb("id", ">", cursorId)]),
+					]),
+				);
 			}
 		}
 
@@ -738,12 +778,61 @@ export class ContentRepository {
 	}
 
 	/**
+	 * Apply the optional case-insensitive `q` substring filter across the
+	 * handler-resolved `searchColumns` (OR'd). User input is treated literally
+	 * (LIKE wildcards escaped) and `lower()` is applied on both sides for
+	 * SQLite/Postgres case-insensitive parity.
+	 */
+	private applySearchFilter<QB extends { where: (cb: (eb: any) => unknown) => QB }>(
+		query: QB,
+		where?: { q?: string; searchColumns?: string[] },
+	): QB {
+		const term = where?.q?.trim();
+		const columns = where?.searchColumns;
+		if (!term || !columns || columns.length === 0) return query;
+
+		const escaped = term.replace(LIKE_WILDCARD_RE, (c) => `\\${c}`);
+		const pattern = `%${escaped}%`;
+
+		return query.where((eb) =>
+			eb.or(
+				columns.map((col) => {
+					validateIdentifier(col, "search column");
+					return eb(sql`lower(${sql.ref(col)})`, "like", sql`lower(${pattern}) escape '\\'`);
+				}),
+			),
+		);
+	}
+
+	/**
+	 * Apply the optional inclusive date-range filter. The field is mapped
+	 * through `DATE_FILTER_COLUMNS` (a closed whitelist), and bounds compare
+	 * lexicographically against the stored ISO 8601 timestamps. A `publishedAt`
+	 * range naturally excludes never-published rows (their column is NULL).
+	 */
+	private applyDateFilter<QB extends { where: (cb: (eb: any) => unknown) => QB }>(
+		query: QB,
+		where?: { dateFilter?: { field: string; from?: string; to?: string } },
+	): QB {
+		const filter = where?.dateFilter;
+		if (!filter) return query;
+		const column = DATE_FILTER_COLUMNS[filter.field as ContentDateField];
+		if (!column) {
+			throw new EmDashValidationError(`Invalid date filter field: ${filter.field}`);
+		}
+		const { from, to } = filter;
+		if (!from && !to) return query;
+
+		let next = query;
+		if (from) next = next.where((eb) => eb(column as any, ">=", from));
+		if (to) next = next.where((eb) => eb(column as any, "<=", to));
+		return next;
+	}
+
+	/**
 	 * Count content items
 	 */
-	async count(
-		type: string,
-		where?: { status?: string; authorId?: string; locale?: string },
-	): Promise<number> {
+	async count(type: string, where?: FindManyOptions["where"]): Promise<number> {
 		const tableName = getTableName(type);
 
 		let query = this.db
@@ -763,8 +852,54 @@ export class ContentRepository {
 			query = query.where("locale" as any, "=", where.locale);
 		}
 
+		query = this.applySearchFilter(query, where);
+		query = this.applyDateFilter(query, where);
+
 		const result = await query.executeTakeFirst();
 		return Number(result?.count || 0);
+	}
+
+	/**
+	 * Distinct, non-null `author_id` values across the collection's live
+	 * (non-trashed) content. Used to populate the admin author filter with
+	 * only the users who have actually authored entries, rather than the
+	 * full user directory (which requires admin privileges to read).
+	 */
+	async findDistinctAuthorIds(type: string): Promise<string[]> {
+		const tableName = getTableName(type);
+
+		const rows = await this.db
+			.selectFrom(tableName as keyof Database)
+			.select("author_id")
+			.distinct()
+			.where("deleted_at" as never, "is", null)
+			.where("author_id" as never, "is not", null)
+			.execute();
+
+		return rows
+			.map((row) => (row as { author_id: string | null }).author_id)
+			.filter((id): id is string => id !== null);
+	}
+
+	// get overall statistics (total, published, draft) for a content type in a single query
+	async getStats(type: string): Promise<{ total: number; published: number; draft: number }> {
+		const tableName = getTableName(type);
+
+		const result = await this.db
+			.selectFrom(tableName as keyof Database)
+			.select((eb) => [
+				eb.fn.count("id").as("total"),
+				eb.fn.sum(eb.case().when("status", "=", "published").then(1).else(0).end()).as("published"),
+				eb.fn.sum(eb.case().when("status", "=", "draft").then(1).else(0).end()).as("draft"),
+			])
+			.where("deleted_at" as never, "is", null)
+			.executeTakeFirst();
+
+		return {
+			total: Number(result?.total || 0),
+			published: Number(result?.published || 0),
+			draft: Number(result?.draft || 0),
+		};
 	}
 
 	/**
@@ -856,10 +991,22 @@ export class ContentRepository {
 	 * Returns all content where scheduled_at <= now, regardless of status.
 	 * This covers both draft-scheduled posts (status='scheduled') and
 	 * published posts with scheduled draft changes (status='published').
+	 *
+	 * `limit` (optional) caps how many due rows are returned, oldest-due first.
+	 * The scheduled-publishing sweep passes a limit so a large backlog can't
+	 * fan out unbounded publish/webhook work in a single tick (and blow a Worker
+	 * invocation's CPU/subrequest budget); the remainder drains on later ticks.
 	 */
-	async findReadyToPublish(type: string): Promise<ContentItem[]> {
+	async findReadyToPublish(type: string, limit?: number): Promise<ContentItem[]> {
 		const tableName = getTableName(type);
 		const now = new Date().toISOString();
+
+		// Embed an empty fragment when unbounded so callers that want every due
+		// row (manual flows, tests) keep the original behaviour.
+		const limitClause =
+			typeof limit === "number" && Number.isInteger(limit) && limit > 0
+				? sql`LIMIT ${limit}`
+				: sql``;
 
 		const result = await sql<Record<string, unknown>>`
 			SELECT * FROM ${sql.ref(tableName)}
@@ -867,6 +1014,7 @@ export class ContentRepository {
 			AND scheduled_at <= ${now}
 			AND deleted_at IS NULL
 			ORDER BY scheduled_at ASC
+			${limitClause}
 		`.execute(this.db);
 
 		return result.rows.map((row) => this.mapRow(type, row));
@@ -895,8 +1043,27 @@ export class ContentRepository {
 	 * Syncs the draft revision's data into the content table columns so the
 	 * content table always reflects the published version.
 	 * If no draft revision exists, creates one from current data and publishes it.
+	 *
+	 * `publishedAt` (optional) overrides the publication timestamp. If omitted,
+	 * the existing `published_at` is preserved (idempotent re-publish keeps the
+	 * original date) and falls back to the current time on first publish. Pass
+	 * an explicit value to backdate a publish (e.g. when migrating content from
+	 * another CMS).
+	 *
+	 * `requireDue` (optional) gates the publish on the row still being due:
+	 * `scheduled_at` non-null and in the past. Used by the scheduled-publishing
+	 * sweep to avoid publishing content an editor unscheduled or rescheduled
+	 * between selection and publish. It claims the row with a single conditional
+	 * UPDATE (clearing `scheduled_at`) before any other write, so it is atomic
+	 * even on D1 (no multi-statement transactions) and serialises against
+	 * `unschedule()` and concurrent sweeps — no TOCTOU and no double publish.
 	 */
-	async publish(type: string, id: string): Promise<ContentItem> {
+	async publish(
+		type: string,
+		id: string,
+		publishedAt?: string,
+		requireDue = false,
+	): Promise<ContentItem> {
 		const tableName = getTableName(type);
 		const now = new Date().toISOString();
 
@@ -905,53 +1072,145 @@ export class ContentRepository {
 			throw new EmDashValidationError("Content item not found");
 		}
 
-		const revisionRepo = new RevisionRepository(this.db);
-		let revisionToPublish = existing.draftRevisionId || existing.liveRevisionId;
-
-		if (!revisionToPublish) {
-			// No revision exists - create one from current data
-			const revision = await revisionRepo.create({
-				collection: type,
-				entryId: id,
-				data: existing.data,
-			});
-			revisionToPublish = revision.id;
+		// Scheduled sweep: atomically claim the row before any other write. A
+		// single conditional UPDATE is atomic per-statement on every dialect
+		// (it doesn't depend on a wrapping transaction, which D1 lacks). If the
+		// schedule was cleared or pushed to the future (unschedule/reschedule)
+		// or another sweep already claimed it, this affects 0 rows and we bail
+		// before promoting any revision — so the row can't be double-published.
+		let claimedScheduledAt: string | null = null;
+		let claimedUpdatedAt: string | null = null;
+		if (requireDue) {
+			const claim = await sql`
+				UPDATE ${sql.ref(tableName)}
+				SET scheduled_at = NULL,
+					updated_at = ${now}
+				WHERE id = ${id}
+				AND scheduled_at IS NOT NULL
+				AND scheduled_at <= ${now}
+				AND deleted_at IS NULL
+			`.execute(this.db);
+			if ((claim.numAffectedRows ?? 0n) === 0n) {
+				throw new ScheduledNotDueError();
+			}
+			// Remember what we cleared so we can put it back if the publish work
+			// below fails on a driver without transactions (see catch). Both
+			// values come from the pre-claim snapshot: if a concurrent
+			// reschedule-to-a-different-past-time landed between findById and the
+			// claim, the restore writes the snapshot value rather than the one the
+			// claim actually cleared. That window is tiny and the restore is
+			// best-effort retry bookkeeping, so the imprecision is acceptable.
+			claimedScheduledAt = existing.scheduledAt;
+			claimedUpdatedAt = existing.updatedAt;
 		}
 
-		// Sync the revision's data into the content table columns
-		// so the content table always holds the published version
-		const revision = await revisionRepo.findById(revisionToPublish);
-		if (revision) {
-			await this.syncDataColumns(type, id, revision.data);
+		// Track whether the final publish write committed. On D1 the claim above
+		// is already durable (withTransaction is a no-op there), so if a later
+		// step throws we must restore the schedule — otherwise the row is left
+		// `scheduled` with `scheduled_at = NULL` and no sweep ever retries it.
+		let publishCommitted = false;
+		try {
+			const revisionRepo = new RevisionRepository(this.db);
+			let revisionToPublish = existing.draftRevisionId || existing.liveRevisionId;
 
-			// Sync slug from revision if stored there
-			if (typeof revision.data._slug === "string") {
+			if (!revisionToPublish) {
+				// No revision exists - create one from current data
+				const revision = await revisionRepo.create({
+					collection: type,
+					entryId: id,
+					data: existing.data,
+				});
+				revisionToPublish = revision.id;
+			}
+
+			// Sync the revision's data into the content table columns
+			// so the content table always holds the published version
+			const revision = await revisionRepo.findById(revisionToPublish);
+			if (revision) {
+				await this.syncDataColumns(type, id, revision.data);
+
+				// Sync slug from revision if stored there
+				if (typeof revision.data._slug === "string") {
+					await sql`
+						UPDATE ${sql.ref(tableName)}
+						SET slug = ${revision.data._slug}
+						WHERE id = ${id}
+					`.execute(this.db);
+				}
+			}
+
+			if (publishedAt !== undefined) {
+				// Caller supplied an explicit timestamp, so we overwrite published_at
+				// directly (used to backdate a publish, e.g. for content migrations).
 				await sql`
 					UPDATE ${sql.ref(tableName)}
-					SET slug = ${revision.data._slug}
+					SET live_revision_id = ${revisionToPublish},
+						draft_revision_id = NULL,
+						status = 'published',
+						scheduled_at = NULL,
+						published_at = ${publishedAt},
+						updated_at = ${now}
 					WHERE id = ${id}
+					AND deleted_at IS NULL
+				`.execute(this.db);
+			} else {
+				// No timestamp supplied — preserve existing published_at on
+				// idempotent re-publish, fall back to `now` on first publish.
+				await sql`
+					UPDATE ${sql.ref(tableName)}
+					SET live_revision_id = ${revisionToPublish},
+						draft_revision_id = NULL,
+						status = 'published',
+						scheduled_at = NULL,
+						published_at = COALESCE(published_at, ${now}),
+						updated_at = ${now}
+					WHERE id = ${id}
+					AND deleted_at IS NULL
 				`.execute(this.db);
 			}
+			publishCommitted = true;
+
+			const updated = await this.findById(type, id);
+			if (!updated) {
+				throw new Error("Content not found");
+			}
+
+			return updated;
+		} catch (error) {
+			// Best-effort schedule restore for the no-transaction (D1) case so a
+			// failed publish stays retryable. Skipped when the publish actually
+			// committed (the failure was afterwards). On SQLite/Postgres the
+			// enclosing transaction rolls the claim back, so this restore also
+			// rolls back — a harmless no-op. Never mask the original error.
+			if (requireDue && claimedScheduledAt && !publishCommitted) {
+				try {
+					// Only restore if the row still has pending work: either it's not
+					// published, or it's a published row that still has a draft change
+					// queued. This avoids re-adding a stale schedule (and triggering a
+					// redundant republish) when another actor fully published the row
+					// in the failure window — that publish clears draft_revision_id.
+					// Restore updated_at to its pre-claim value too — the claim bumped
+					// it to `now`, and a failed publish made no real change, so leaving
+					// it advanced would be a phantom modification for "changed since"
+					// consumers (sync, ETags, incremental indexers).
+					await sql`
+						UPDATE ${sql.ref(tableName)}
+						SET scheduled_at = ${claimedScheduledAt},
+							updated_at = ${claimedUpdatedAt ?? now}
+						WHERE id = ${id}
+						AND scheduled_at IS NULL
+						AND deleted_at IS NULL
+						AND (status != 'published' OR draft_revision_id IS NOT NULL)
+					`.execute(this.db);
+				} catch (restoreError) {
+					console.error(
+						`[content] Failed to restore schedule for ${type}/${id} after publish failure:`,
+						restoreError,
+					);
+				}
+			}
+			throw error;
 		}
-
-		await sql`
-			UPDATE ${sql.ref(tableName)}
-			SET live_revision_id = ${revisionToPublish},
-				draft_revision_id = NULL,
-				status = 'published',
-				scheduled_at = NULL,
-				published_at = COALESCE(published_at, ${now}),
-				updated_at = ${now}
-			WHERE id = ${id}
-			AND deleted_at IS NULL
-		`.execute(this.db);
-
-		const updated = await this.findById(type, id);
-		if (!updated) {
-			throw new Error("Content not found");
-		}
-
-		return updated;
 	}
 
 	/**
@@ -992,6 +1251,7 @@ export class ContentRepository {
 			UPDATE ${sql.ref(tableName)}
 			SET live_revision_id = NULL,
 				status = 'draft',
+				published_at = NULL,
 				updated_at = ${now}
 			WHERE id = ${id}
 			AND deleted_at IS NULL
@@ -1003,6 +1263,45 @@ export class ContentRepository {
 		}
 
 		return updated;
+	}
+
+	/**
+	 * Set the draft revision pointer for a content item.
+	 *
+	 * Used by seed/import paths that stage a new revision's data before
+	 * promoting it to live via `publish()`.
+	 *
+	 * Validates that the content item exists and is not soft-deleted, that
+	 * the revision exists, and that the revision belongs to the same
+	 * collection and entry. Without these checks, a caller could leave the
+	 * content row pointing at a missing or unrelated revision.
+	 */
+	async setDraftRevision(type: string, id: string, revisionId: string): Promise<void> {
+		const tableName = getTableName(type);
+		const now = new Date().toISOString();
+
+		const existing = await this.findById(type, id);
+		if (!existing) {
+			throw new EmDashValidationError("Content item not found");
+		}
+
+		const revisionRepo = new RevisionRepository(this.db);
+		const revision = await revisionRepo.findById(revisionId);
+		if (!revision) {
+			throw new EmDashValidationError("Revision not found");
+		}
+
+		if (revision.collection !== type || revision.entryId !== id) {
+			throw new EmDashValidationError("Revision does not belong to the specified content item");
+		}
+
+		await sql`
+			UPDATE ${sql.ref(tableName)}
+			SET draft_revision_id = ${revisionId},
+				updated_at = ${now}
+			WHERE id = ${id}
+			AND deleted_at IS NULL
+		`.execute(this.db);
 	}
 
 	/**
@@ -1057,6 +1356,7 @@ export class ContentRepository {
 		for (const [key, value] of Object.entries(data)) {
 			if (SYSTEM_COLUMNS.has(key)) continue;
 			if (key.startsWith("_")) continue; // revision metadata
+			validateIdentifier(key, "content field name");
 			updates[key] = serializeValue(value);
 		}
 
@@ -1132,7 +1432,10 @@ export class ContentRepository {
 			scheduledAt: "scheduled_at",
 			deletedAt: "deleted_at",
 			title: "title",
+			name: "name",
 			slug: "slug",
+			status: "status",
+			locale: "locale",
 		};
 
 		const mapped = mapping[field];

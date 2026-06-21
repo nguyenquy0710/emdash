@@ -15,10 +15,10 @@ import type { Editor } from "@tiptap/react";
 import { userEvent } from "@vitest/browser/context";
 import * as React from "react";
 import { describe, it, expect, vi } from "vitest";
-import { render } from "vitest-browser-react";
 
 import { BlockMenu } from "../../src/components/editor/BlockMenu";
 import { PortableTextEditor } from "../../src/components/PortableTextEditor";
+import { render } from "../utils/render";
 
 // ---------------------------------------------------------------------------
 // Mocks — same as other editor tests
@@ -391,8 +391,8 @@ describe("BlockMenu", () => {
 		const { editor, pm } = await getEditor();
 		const onClose = vi.fn();
 
-		// Focus on first paragraph
-		editor.commands.focus("start");
+		// Select the first block as the drag handle does before opening the menu
+		editor.commands.setNodeSelection(0);
 
 		// Count initial paragraphs
 		const initialParagraphs = pm.querySelectorAll("p").length;
@@ -418,7 +418,8 @@ describe("BlockMenu", () => {
 		const { editor, pm } = await getEditor();
 		const onClose = vi.fn();
 
-		editor.commands.focus("start");
+		// Select the first block as the drag handle does before opening the menu
+		editor.commands.setNodeSelection(0);
 
 		const initialParagraphs = pm.querySelectorAll("p").length;
 

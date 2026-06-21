@@ -17,6 +17,7 @@ import type {
 	PluginContext,
 	ContentHookEvent,
 	ContentDeleteEvent,
+	ContentPublishStateChangeEvent,
 	MediaUploadEvent,
 	MediaAfterUploadEvent,
 	LifecycleEvent,
@@ -30,6 +31,8 @@ import type {
 	ContentAfterSaveHandler,
 	ContentBeforeDeleteHandler,
 	ContentAfterDeleteHandler,
+	ContentAfterPublishHandler,
+	ContentAfterUnpublishHandler,
 	MediaBeforeUploadHandler,
 	MediaAfterUploadHandler,
 	LifecycleHandler,
@@ -61,6 +64,8 @@ type HookNameV2 =
 	| "content:afterSave"
 	| "content:beforeDelete"
 	| "content:afterDelete"
+	| "content:afterPublish"
+	| "content:afterUnpublish"
 	| "media:beforeUpload"
 	| "media:afterUpload"
 	| "cron"
@@ -86,6 +91,8 @@ interface HookHandlerMap {
 	"content:afterSave": ContentAfterSaveHandler;
 	"content:beforeDelete": ContentBeforeDeleteHandler;
 	"content:afterDelete": ContentAfterDeleteHandler;
+	"content:afterPublish": ContentAfterPublishHandler;
+	"content:afterUnpublish": ContentAfterUnpublishHandler;
 	"media:beforeUpload": MediaBeforeUploadHandler;
 	"media:afterUpload": MediaAfterUploadHandler;
 	cron: CronHandler;
@@ -211,6 +218,8 @@ export class HookPipeline {
 			this.registerPluginHook(plugin, "content:afterSave");
 			this.registerPluginHook(plugin, "content:beforeDelete");
 			this.registerPluginHook(plugin, "content:afterDelete");
+			this.registerPluginHook(plugin, "content:afterPublish");
+			this.registerPluginHook(plugin, "content:afterUnpublish");
 			this.registerPluginHook(plugin, "media:beforeUpload");
 			this.registerPluginHook(plugin, "media:afterUpload");
 			this.registerPluginHook(plugin, "cron");
@@ -239,26 +248,32 @@ export class HookPipeline {
 	 * capability will have that hook silently skipped at registration time.
 	 */
 	private static readonly HOOK_REQUIRED_CAPABILITY: ReadonlyMap<string, string> = new Map([
-		// Email
-		["email:beforeSend", "email:intercept"],
-		["email:afterSend", "email:intercept"],
-		["email:deliver", "email:provide"],
-		// Content — beforeSave can mutate content, so requires write:content.
-		// afterSave is read-only notification, so read:content suffices.
-		["content:beforeSave", "write:content"],
-		["content:afterSave", "read:content"],
-		["content:beforeDelete", "read:content"],
-		["content:afterDelete", "read:content"],
+		// Email — registering email:beforeSend/afterSend/deliver requires the
+		// matching `hooks.email-*:register` capability. These are distinct
+		// from `email:send` (which gates ctx.email) so that "this plugin
+		// reads/writes email events" is visible separately from "this
+		// plugin can send email".
+		["email:beforeSend", "hooks.email-events:register"],
+		["email:afterSend", "hooks.email-events:register"],
+		["email:deliver", "hooks.email-transport:register"],
+		// Content — beforeSave can mutate content, so requires content:write.
+		// afterSave is read-only notification, so content:read suffices.
+		["content:beforeSave", "content:write"],
+		["content:afterSave", "content:read"],
+		["content:beforeDelete", "content:read"],
+		["content:afterDelete", "content:read"],
+		["content:afterPublish", "content:read"],
+		["content:afterUnpublish", "content:read"],
 		// Media
-		["media:beforeUpload", "write:media"],
-		["media:afterUpload", "read:media"],
+		["media:beforeUpload", "media:write"],
+		["media:afterUpload", "media:read"],
 		// Comments — hooks expose author email, IP hash, user agent
-		["comment:beforeCreate", "read:users"],
-		["comment:moderate", "read:users"],
-		["comment:afterCreate", "read:users"],
-		["comment:afterModerate", "read:users"],
+		["comment:beforeCreate", "users:read"],
+		["comment:moderate", "users:read"],
+		["comment:afterCreate", "users:read"],
+		["comment:afterModerate", "users:read"],
 		// Page fragments — can inject arbitrary scripts into every public page
-		["page:fragments", "page:inject"],
+		["page:fragments", "hooks.page-fragments:register"],
 	]);
 
 	/**
@@ -313,7 +328,11 @@ export class HookPipeline {
 			);
 
 			if (ready.length === 0) {
-				// Circular dependency or missing dependency - just add by priority
+				// Circular dependency or missing dependency - log warning and fall back to priority
+				const pluginIds = remaining.map((h) => h.pluginId).join(", ");
+				console.warn(
+					`[hooks] Hook dependency cycle or missing dependency detected among plugins: ${pluginIds}. Falling back to priority order.`,
+				);
 				remaining.sort((a, b) => a.priority - b.priority);
 				sorted.push(...remaining);
 				break;
@@ -333,12 +352,16 @@ export class HookPipeline {
 	 * Execute a hook with timeout
 	 */
 	private async executeWithTimeout<T>(fn: () => Promise<T>, timeout: number): Promise<T> {
-		return Promise.race([
-			fn(),
-			new Promise<T>((_, reject) =>
-				setTimeout(() => reject(new Error(`Hook timeout after ${timeout}ms`)), timeout),
-			),
-		]);
+		let timer: ReturnType<typeof setTimeout>;
+		const timeoutPromise = new Promise<T>(
+			(_, reject) =>
+				(timer = setTimeout(() => reject(new Error(`Hook timeout after ${timeout}ms`)), timeout)),
+		);
+		try {
+			return await Promise.race([fn(), timeoutPromise]);
+		} finally {
+			clearTimeout(timer!);
+		}
 	}
 
 	// =========================================================================
@@ -550,7 +573,7 @@ export class HookPipeline {
 
 		for (const hook of hooks) {
 			const { handler } = hook;
-			const event: ContentDeleteEvent = { id, collection };
+			const event: ContentDeleteEvent = { id, collection, permanent: false };
 			const ctx = this.getContext(hook.pluginId);
 			const start = Date.now();
 
@@ -586,13 +609,97 @@ export class HookPipeline {
 	/**
 	 * Run content:afterDelete hooks
 	 */
-	async runContentAfterDelete(id: string, collection: string): Promise<HookResult<void>[]> {
+	async runContentAfterDelete(
+		id: string,
+		collection: string,
+		permanent: boolean,
+	): Promise<HookResult<void>[]> {
 		const hooks = this.getTypedHooks("content:afterDelete");
 		const results: HookResult<void>[] = [];
 
 		for (const hook of hooks) {
 			const { handler } = hook;
-			const event: ContentDeleteEvent = { id, collection };
+			const event: ContentDeleteEvent = { id, collection, permanent };
+			const ctx = this.getContext(hook.pluginId);
+			const start = Date.now();
+
+			try {
+				await this.executeWithTimeout(() => handler(event, ctx), hook.timeout);
+				results.push({
+					success: true,
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+			} catch (error) {
+				results.push({
+					success: false,
+					error: error instanceof Error ? error : new Error(String(error)),
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+
+				if (hook.errorPolicy === "abort") {
+					throw error;
+				}
+			}
+		}
+
+		return results;
+	}
+
+	/**
+	 * Run content:afterPublish hooks (fire-and-forget).
+	 */
+	async runContentAfterPublish(
+		content: Record<string, unknown>,
+		collection: string,
+	): Promise<HookResult<void>[]> {
+		const hooks = this.getTypedHooks("content:afterPublish");
+		const results: HookResult<void>[] = [];
+
+		for (const hook of hooks) {
+			const { handler } = hook;
+			const event: ContentPublishStateChangeEvent = { content, collection };
+			const ctx = this.getContext(hook.pluginId);
+			const start = Date.now();
+
+			try {
+				await this.executeWithTimeout(() => handler(event, ctx), hook.timeout);
+				results.push({
+					success: true,
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+			} catch (error) {
+				results.push({
+					success: false,
+					error: error instanceof Error ? error : new Error(String(error)),
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+
+				if (hook.errorPolicy === "abort") {
+					throw error;
+				}
+			}
+		}
+
+		return results;
+	}
+
+	/**
+	 * Run content:afterUnpublish hooks (fire-and-forget).
+	 */
+	async runContentAfterUnpublish(
+		content: Record<string, unknown>,
+		collection: string,
+	): Promise<HookResult<void>[]> {
+		const hooks = this.getTypedHooks("content:afterUnpublish");
+		const results: HookResult<void>[] = [];
+
+		for (const hook of hooks) {
+			const { handler } = hook;
+			const event: ContentPublishStateChangeEvent = { content, collection };
 			const ctx = this.getContext(hook.pluginId);
 			const start = Date.now();
 
@@ -1116,6 +1223,17 @@ export class HookPipeline {
 	}
 
 	/**
+	 * Get all plugins that registered a non-exclusive handler for a given
+	 * hook (e.g. `email:beforeSend`, `email:afterSend`), preserving priority
+	 * order. Partitions with `getExclusiveHookProviders()`, which returns
+	 * plugins whose registration is marked `exclusive: true`.
+	 */
+	getHookProviders(hookName: string): Array<{ pluginId: string }> {
+		const hooks = this.hooks.get(hookName as HookNameV2) ?? [];
+		return hooks.filter((h) => !h.exclusive).map((h) => ({ pluginId: h.pluginId }));
+	}
+
+	/**
 	 * Invoke an exclusive hook — dispatch only to the selected provider.
 	 * Returns null if no provider is selected or if the selected hook
 	 * is not found in the pipeline.
@@ -1179,6 +1297,13 @@ export interface ExclusiveHookResolutionOptions {
 	isActive: (pluginId: string) => boolean;
 	/** Read an option value from persistent storage. */
 	getOption: (key: string) => Promise<string | null>;
+	/**
+	 * Batch-read option values for many keys in a single round trip.
+	 * When provided, resolution reads all current selections through this
+	 * instead of one getOption() call per hook. Keys absent from the
+	 * returned map are treated as unset.
+	 */
+	getOptions?: (keys: string[]) => Promise<ReadonlyMap<string, string>>;
 	/** Write an option value to persistent storage. */
 	setOption: (key: string, value: string) => Promise<void>;
 	/** Delete an option from persistent storage. */
@@ -1204,8 +1329,26 @@ const EXCLUSIVE_HOOK_KEY_PREFIX = "emdash:exclusive_hook:";
  * 5. If multiple providers and no hint → leave unselected (admin must choose).
  */
 export async function resolveExclusiveHooks(opts: ExclusiveHookResolutionOptions): Promise<void> {
-	const { pipeline, isActive, getOption, setOption, deleteOption, preferredHints } = opts;
+	const { pipeline, isActive, getOption, getOptions, setOption, deleteOption, preferredHints } =
+		opts;
 	const exclusiveHookNames = pipeline.getRegisteredExclusiveHooks();
+	if (exclusiveHookNames.length === 0) return;
+
+	// Batch-read current selections in one round trip when the caller
+	// provides a batch reader (1 query instead of N sequential gets).
+	let batchedSelections: ReadonlyMap<string, string> | undefined;
+	if (getOptions) {
+		try {
+			batchedSelections = await getOptions(
+				exclusiveHookNames.map((hookName) => `${EXCLUSIVE_HOOK_KEY_PREFIX}${hookName}`),
+			);
+		} catch {
+			// Options table may not be ready. Matches the per-key tolerance
+			// below: every hook's read would fail, so resolution is skipped
+			// entirely without touching any selection.
+			return;
+		}
+	}
 
 	for (const hookName of exclusiveHookNames) {
 		const providers = pipeline.getExclusiveHookProviders(hookName);
@@ -1215,11 +1358,15 @@ export async function resolveExclusiveHooks(opts: ExclusiveHookResolutionOptions
 
 		const key = `${EXCLUSIVE_HOOK_KEY_PREFIX}${hookName}`;
 		let currentSelection: string | null = null;
-		try {
-			currentSelection = await getOption(key);
-		} catch {
-			// Options table may not be ready
-			continue;
+		if (batchedSelections) {
+			currentSelection = batchedSelections.get(key) ?? null;
+		} else {
+			try {
+				currentSelection = await getOption(key);
+			} catch {
+				// Options table may not be ready
+				continue;
+			}
 		}
 
 		// If selection exists and the plugin is still active → keep it

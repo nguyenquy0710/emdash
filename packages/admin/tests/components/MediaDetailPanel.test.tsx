@@ -1,10 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import * as React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render } from "vitest-browser-react";
 
 import { MediaDetailPanel } from "../../src/components/MediaDetailPanel";
 import type { MediaItem } from "../../src/lib/api";
+import { render } from "../utils/render.tsx";
 
 vi.mock("../../src/lib/api", async () => {
 	const actual = await vi.importActual("../../src/lib/api");
@@ -135,11 +135,6 @@ describe("MediaDetailPanel", () => {
 		await expect
 			.element(screen.getByPlaceholder("Optional caption for display"), { timeout: 100 })
 			.not.toBeInTheDocument();
-	});
-
-	it("hides caption textarea for non-images", async () => {
-		const pdfItem = makePdfItem();
-		const screen = await renderPanel({ item: pdfItem });
 		await expect
 			.element(screen.getByLabelText("Caption"), { timeout: 100 })
 			.not.toBeInTheDocument();
@@ -256,5 +251,20 @@ describe("MediaDetailPanel", () => {
 
 		// The alt text should now show item2's alt
 		await expect.element(screen.getByLabelText("Alt Text")).toHaveValue("Alt two");
+	});
+});
+
+describe("MediaDetailPanel file URL", () => {
+	it("shows the absolute file URL with a Copy URL action", async () => {
+		const screen = await renderPanel({
+			item: makeImageItem({ url: "/_emdash/api/media/file/01ABC.jpg" }),
+		});
+
+		// Relative local-storage URLs are shown as absolute (origin-resolved)
+		// so they can be pasted anywhere. The Kumo ClipboardText component
+		// renders the value as text and a copy button (labelled "Copy URL").
+		const absolute = new URL("/_emdash/api/media/file/01ABC.jpg", window.location.origin).href;
+		await expect.element(screen.getByText(absolute)).toBeVisible();
+		await expect.element(screen.getByRole("button", { name: /Copy URL/ })).toBeVisible();
 	});
 });

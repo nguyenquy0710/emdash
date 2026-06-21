@@ -1,6 +1,7 @@
 import type { Kysely, Selectable, Updateable } from "kysely";
 import { ulid } from "ulidx";
 
+import { chunks, SQL_BATCH_SIZE } from "../../utils/chunks.js";
 import type { Database, UserTable } from "../types.js";
 import { encodeCursor, decodeCursor, type FindManyResult } from "./types.js";
 
@@ -86,6 +87,23 @@ export class UserRepository {
 	}
 
 	/**
+	 * Batch-resolve users by ID. Returns only the users that exist; missing
+	 * IDs are silently dropped. Chunked at `SQL_BATCH_SIZE` to stay within
+	 * D1's bind-parameter limit.
+	 */
+	async findByIds(ids: string[]): Promise<User[]> {
+		const unique = [...new Set(ids)].filter((id) => id.length > 0);
+		if (unique.length === 0) return [];
+
+		const out: User[] = [];
+		for (const batch of chunks(unique, SQL_BATCH_SIZE)) {
+			const rows = await this.db.selectFrom("users").selectAll().where("id", "in", batch).execute();
+			for (const row of rows) out.push(this.rowToUser(row));
+		}
+		return out;
+	}
+
+	/**
 	 * Find user by email (case-insensitive)
 	 */
 	async findByEmail(email: string): Promise<User | null> {
@@ -123,14 +141,12 @@ export class UserRepository {
 
 		if (options.cursor) {
 			const decoded = decodeCursor(options.cursor);
-			if (decoded) {
-				query = query.where((eb) =>
-					eb.or([
-						eb("created_at", "<", decoded.orderValue),
-						eb.and([eb("created_at", "=", decoded.orderValue), eb("id", "<", decoded.id)]),
-					]),
-				);
-			}
+			query = query.where((eb) =>
+				eb.or([
+					eb("created_at", "<", decoded.orderValue),
+					eb.and([eb("created_at", "=", decoded.orderValue), eb("id", "<", decoded.id)]),
+				]),
+			);
 		}
 
 		const rows = await query.execute();

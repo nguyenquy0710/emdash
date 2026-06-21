@@ -163,7 +163,9 @@ test.describe("Revisions", () => {
 		expect(response.status()).toBe(200);
 
 		// Wait for autosave indicator
-		await expect(page.locator("text=Saved")).toBeVisible({ timeout: 5000 });
+		await expect(page.getByRole("status", { name: "Autosave status" })).toContainText("Saved", {
+			timeout: 5000,
+		});
 
 		// Now publish to create a new live revision
 		const publishButton = page.getByRole("button", { name: "Publish" });
@@ -224,7 +226,7 @@ test.describe("Revisions", () => {
 		// Click on the non-latest (older) revision to view its data
 		// The second item (index 1) is the older revision
 		const olderRevision = revisionItems.nth(1);
-		await olderRevision.locator("button.flex-1.text-left").click();
+		await olderRevision.locator("button.flex-1.text-start").click();
 
 		// A diff view or snapshot should appear
 		// Look for either "Content snapshot" or a diff with field changes
@@ -284,9 +286,11 @@ test.describe("Revisions", () => {
 		const revisionItems = page.locator(".rounded-md.border.p-3");
 		await expect(revisionItems.first()).toBeVisible({ timeout: 10000 });
 
-		// Find the restore button on the older revision (not the "Current" one)
-		// The restore button uses ArrowCounterClockwise icon and title="Restore this version"
-		const restoreButton = page.locator('button[title="Restore this version"]').first();
+		// Find the restore button on the older revision (not the "Current" one).
+		// The restore button uses ArrowCounterClockwise icon. Kumo 2.x renders
+		// <Button title> as a Tooltip popup rather than a DOM title attribute,
+		// so we locate by aria-label instead.
+		const restoreButton = page.locator('button[aria-label="Restore this version"]').first();
 		await expect(restoreButton).toBeVisible({ timeout: 5000 });
 
 		// Click restore -- this opens a ConfirmDialog

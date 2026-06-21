@@ -10,12 +10,23 @@
  * to avoid bundling Node.js-only code into the production build.
  */
 
+import { createRequire } from "node:module";
+
 import type { AstroIntegration, AstroIntegrationLogger } from "astro";
 
+import { validateAllowedOrigins, validateOriginShape } from "../../auth/allowed-origins.js";
+import { INTERNAL_MEDIA_PREFIX } from "../../media/normalize.js";
 import type { ResolvedPlugin } from "../../plugins/types.js";
+import { VERSION } from "../../version.js";
 import { local } from "../storage/adapters.js";
-import { injectCoreRoutes, injectBuiltinAuthRoutes, injectMcpRoute } from "./routes.js";
-import type { EmDashConfig, PluginDescriptor } from "./runtime.js";
+import { notoSans } from "./font-provider.js";
+import {
+	injectCoreRoutes,
+	injectBuiltinAuthRoutes,
+	injectAuthProviderRoutes,
+	injectMcpRoute,
+} from "./routes.js";
+import type { EmDashConfig } from "./runtime.js";
 import { createViteConfig } from "./vite-config.js";
 
 // Re-export runtime types and functions
@@ -27,11 +38,114 @@ export type {
 } from "./runtime.js";
 export { getStoredConfig } from "./runtime.js";
 
+/**
+ * Resolve the version of Astro the host project is building with, by reading
+ * `astro/package.json` from the project's own dependency tree. Surfaced to the
+ * admin and the registry install gate so a plugin's `env:astro` constraint can
+ * be evaluated against the real host version. Returns `undefined` if Astro
+ * can't be resolved (shouldn't happen in a real build, but never throw here).
+ */
+function resolveAstroVersion(): string | undefined {
+	try {
+		const require = createRequire(import.meta.url);
+		const pkg = require("astro/package.json") as { version?: unknown };
+		return typeof pkg.version === "string" ? pkg.version : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Default storage: Local filesystem in .emdash directory */
 const DEFAULT_STORAGE = local({
 	directory: "./.emdash/uploads",
 	baseUrl: "/_emdash/api/media/file",
 });
+
+interface ImageRemotePattern {
+	protocol?: "http" | "https";
+	hostname?: string;
+	pathname?: string;
+}
+
+/**
+ * Build `image.remotePatterns` entries so Astro will optimize EmDash media.
+ *
+ * Astro's image services only transform **absolute** URLs whose host is
+ * authorized; everything else is passed through unoptimized. We authorize the
+ * media sources automatically:
+ *
+ *  1. The storage adapter's public URL host (R2 custom domain, S3/CDN), so
+ *     media served directly from a public bucket is optimized.
+ *  2. The site's own origin, scoped to the media proxy route
+ *     (`/_emdash/api/media/file/**`), so same-origin proxied media (local
+ *     storage, or R2 without a public URL) is optimized too. The pathname
+ *     scope keeps Astro's image endpoint from acting as an open proxy for the
+ *     whole origin. Only registered when `siteUrl` is known at build time;
+ *     `getPublicOrigin` resolves the matching origin at render time.
+ *  3. In `astro dev` the dev-server origin (`localhost:<port>`) isn't known at
+ *     build time, so we register a host-agnostic pattern scoped to the media
+ *     route. This is dev-only — it never ships in a production build — so the
+ *     missing host check can't be abused on a deployed site.
+ *
+ * Returns an empty array when no source is statically known (e.g. a production
+ * build using local storage with no `siteUrl`), in which case media renders as
+ * a plain `<img>`.
+ *
+ * @internal Exported for unit testing.
+ */
+export function buildImageRemotePatterns(
+	storage: { config?: unknown } | undefined,
+	siteUrl: string | undefined,
+	command: "dev" | "build" | "preview" | "sync",
+): ImageRemotePattern[] {
+	const patterns: ImageRemotePattern[] = [];
+
+	const config = storage?.config;
+	const publicUrl =
+		config && typeof config === "object"
+			? (config as { publicUrl?: unknown }).publicUrl
+			: undefined;
+	if (typeof publicUrl === "string" && publicUrl) {
+		try {
+			const url = new URL(publicUrl);
+			// Only authorize http(s) hosts — a `file:`/`ftp:` URL is not a media
+			// origin Astro can fetch.
+			if (url.protocol === "http:" || url.protocol === "https:") {
+				const pattern: ImageRemotePattern = {
+					protocol: url.protocol === "http:" ? "http" : "https",
+					hostname: url.hostname,
+				};
+				// When the public URL has a path prefix (CDN sub-path), scope the
+				// pattern to it so we don't authorize the entire host. Media keys
+				// are appended as `${publicUrl}/${key}`, so the prefix is exact.
+				const prefix = url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname;
+				if (prefix && prefix !== "/") {
+					pattern.pathname = `${prefix}/**`;
+				}
+				patterns.push(pattern);
+			}
+		} catch {
+			// ignore an unparseable public URL
+		}
+	}
+
+	if (siteUrl) {
+		try {
+			patterns.push({
+				hostname: new URL(siteUrl).hostname,
+				pathname: `${INTERNAL_MEDIA_PREFIX}**`,
+			});
+		} catch {
+			// ignore an unparseable site URL
+		}
+	}
+
+	if (command === "dev") {
+		patterns.push({ pathname: `${INTERNAL_MEDIA_PREFIX}**` });
+	}
+
+	return patterns;
+}
 
 // Terminal formatting
 const dim = (s: string) => `\x1b[2m${s}\x1b[22m`;
@@ -42,15 +156,24 @@ const cyan = (s: string) => `\x1b[36m${s}\x1b[39m`;
 function printBanner(_logger: AstroIntegrationLogger): void {
 	const banner = `
 
-  ${bold(cyan("— E M D A S H —"))}
+  ${bold(cyan("— E M D A S H —"))}  ${dim(`v${VERSION}`)}
    `;
 	console.log(banner);
 }
 
-/** Print route injection summary */
-function printRoutesSummary(_logger: AstroIntegrationLogger): void {
-	console.log(`\n  ${dim("›")} Admin UI    ${cyan("/_emdash/admin")}`);
-	console.log(`  ${dim("›")} API         ${cyan("/_emdash/api/*")}`);
+/**
+ * Print dev-server route info with absolute (clickable) URLs, including the
+ * dev-bypass shortcut that skips passkey auth. Dev only -- the dev-bypass
+ * endpoint returns 403 in production.
+ */
+function printDevServerInfo(baseUrl: string, mcpEnabled: boolean): void {
+	const devBypassUrl = `${baseUrl}/_emdash/api/setup/dev-bypass?redirect=/_emdash/admin`;
+	console.log(`\n  ${dim("›")} Admin UI    ${cyan(`${baseUrl}/_emdash/admin`)}`);
+	if (mcpEnabled) {
+		console.log(`  ${dim("›")} MCP server  ${cyan(`${baseUrl}/_emdash/api/mcp`)}`);
+	}
+	console.log(`  ${dim("›")} Dev bypass  ${cyan(devBypassUrl)}`);
+	console.log(`    ${dim("Skips passkey setup/auth and signs you in as a dev admin")}`);
 	console.log("");
 }
 
@@ -88,6 +211,43 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 					"Marketplace plugins run in sandboxed V8 isolates.",
 			);
 		}
+	}
+
+	// Validate siteUrl if provided in astro.config.mjs.
+	// Env-var fallback (EMDASH_SITE_URL / SITE_URL) is handled at runtime by
+	// getPublicOrigin() in api/public-url.ts — NOT here — so Docker images built
+	// without a domain can pick it up at container start via process.env.
+	if (resolvedConfig.siteUrl) {
+		const raw = resolvedConfig.siteUrl;
+		try {
+			const parsed = new URL(raw);
+			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+				throw new Error(`siteUrl must be http or https (got ${parsed.protocol})`);
+			}
+			// Always store origin-normalized value (no path) — security invariant L-1
+			resolvedConfig.siteUrl = parsed.origin;
+		} catch (e) {
+			if (e instanceof TypeError) {
+				throw new Error(`Invalid siteUrl: "${raw}"`, { cause: e });
+			}
+			throw e;
+		}
+	}
+
+	// Validate config.allowedOrigins shape at startup (per-entry rules: parseable,
+	// http(s), no trailing dots, no empty labels). The siteUrl-dependent rules
+	// (Rule A: requires siteUrl; Rule B: must be a subdomain of siteUrl) are
+	// deferred to runtime when config.siteUrl is absent — EMDASH_SITE_URL may
+	// supply it post-build, just like the env-var fallback for siteUrl above.
+	// When config.siteUrl IS present, run the full validator here for fail-fast.
+	if (resolvedConfig.allowedOrigins?.length) {
+		const tagged = resolvedConfig.allowedOrigins.map((origin) => ({
+			origin,
+			source: "config.allowedOrigins" as const,
+		}));
+		resolvedConfig.allowedOrigins = resolvedConfig.siteUrl
+			? validateAllowedOrigins(resolvedConfig.siteUrl, tagged)
+			: validateOriginShape(tagged);
 	}
 
 	// Plugin descriptors from config
@@ -135,12 +295,22 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 		database: resolvedConfig.database,
 		storage: resolvedConfig.storage,
 		auth: resolvedConfig.auth,
+		authProviders: resolvedConfig.authProviders,
 		marketplace: resolvedConfig.marketplace,
+		experimental: resolvedConfig.experimental,
+		siteUrl: resolvedConfig.siteUrl,
+		trustedProxyHeaders: resolvedConfig.trustedProxyHeaders,
+		maxUploadSize: resolvedConfig.maxUploadSize,
+		admin: resolvedConfig.admin,
 	};
 
 	// Determine auth mode for route injection
 	// Check if auth is an AuthDescriptor (has entrypoint) indicating external auth
 	const useExternalAuth = !!(resolvedConfig.auth && "entrypoint" in resolvedConfig.auth);
+
+	// Captured in astro:config:setup so the astro:server:setup hook can tell
+	// whether we're running `astro dev` (where the dev-bypass shortcut applies).
+	let astroCommand: "dev" | "build" | "preview" | "sync" | undefined;
 
 	return {
 		name: "emdash",
@@ -153,7 +323,15 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 				config: astroConfig,
 				command,
 			}) => {
+				astroCommand = command;
 				printBanner(logger);
+				// Capture the host's Astro version so the runtime can expose it
+				// to the admin and the registry install gate for `env:astro`
+				// constraint checks.
+				const astroVersion = resolveAstroVersion();
+				if (astroVersion !== undefined) {
+					serializableConfig.astroVersion = astroVersion;
+				}
 				// Extract i18n config from Astro config
 				// Astro locales can be strings OR { path, codes } objects — normalize to paths
 				if (astroConfig.i18n) {
@@ -167,8 +345,79 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 					};
 				}
 
-				// Update Vite config with virtual modules and other settings
+				// Disable Astro's built-in checkOrigin -- EmDash's own CSRF
+				// layer (checkPublicCsrf in api/csrf.ts) handles origin
+				// validation with dual-origin support: it accepts both the
+				// internal origin AND the public origin from getPublicOrigin(),
+				// which resolves siteUrl from config or env vars at runtime.
+				// Astro's check can't do this because allowedDomains is baked
+				// at build time, which breaks Docker deployments where the
+				// domain is only known at container start via EMDASH_SITE_URL.
+				//
+				// When siteUrl is known at build time, also set allowedDomains
+				// so Astro.url reflects the public origin (helps user template
+				// code that reads Astro.url directly).
+				const securityConfig: Record<string, unknown> = {
+					checkOrigin: false,
+					...(resolvedConfig.siteUrl
+						? {
+								allowedDomains: [{ hostname: new URL(resolvedConfig.siteUrl).hostname }],
+							}
+						: {}),
+				};
+
+				// Inject default Noto Sans font for the admin UI.
+				// Uses the Astro Font API so fonts are downloaded at build time
+				// and self-hosted (no runtime CDN requests).
+				//
+				// The admin CSS references var(--font-emdash) with a system font
+				// fallback. Users can add extra script coverage (Arabic, CJK, etc.)
+				// by passing fonts.scripts in the emdash() config. The custom
+				// notoSans provider resolves all script families from Google Fonts
+				// under a single font-family name, so they stack via unicode-range.
+				const fontsConfig = resolvedConfig.fonts;
+				const emdashFonts =
+					fontsConfig === false
+						? []
+						: [
+								{
+									provider: notoSans({
+										scripts: fontsConfig?.scripts,
+									}),
+									name: "Noto Sans",
+									cssVariable: "--font-emdash",
+									weights: ["100 900" as const],
+									styles: ["normal" as const, "italic" as const],
+									subsets: [
+										"latin" as const,
+										"latin-ext" as const,
+										"cyrillic" as const,
+										"cyrillic-ext" as const,
+										"devanagari" as const,
+										"greek" as const,
+										"greek-ext" as const,
+										"vietnamese" as const,
+									],
+									fallbacks: ["ui-sans-serif", "system-ui", "sans-serif"],
+								},
+							];
+
+				// Authorize media sources for Astro image optimization so the
+				// Image components can generate a responsive srcset for R2/S3 and
+				// same-origin proxied media. `updateConfig` merges arrays, so any
+				// user-configured remotePatterns are preserved.
+				const imageRemotePatterns = buildImageRemotePatterns(
+					resolvedConfig.storage,
+					resolvedConfig.siteUrl,
+					command,
+				);
+
 				updateConfig({
+					security: securityConfig,
+					...(imageRemotePatterns.length ? { image: { remotePatterns: imageRemotePatterns } } : {}),
+					// fonts is a valid AstroConfig key but may not be in the
+					// type definition for the minimum supported Astro version
+					...({ fonts: emdashFonts } as Record<string, unknown>),
 					vite: createViteConfig(
 						{
 							serializableConfig,
@@ -181,17 +430,21 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 				});
 
 				// Inject all core routes
-				injectCoreRoutes(injectRoute);
+				injectCoreRoutes(injectRoute, { srcDir: astroConfig.srcDir });
 
-				// Only inject passkey/oauth/magic-link routes when NOT using external auth
+				// Inject routes from pluggable auth providers (authProviders config)
+				if (resolvedConfig.authProviders?.length) {
+					injectAuthProviderRoutes(injectRoute, resolvedConfig.authProviders);
+				}
+
+				// Inject passkey/oauth/magic-link routes unless transparent external auth is active
 				if (!useExternalAuth) {
 					injectBuiltinAuthRoutes(injectRoute);
 				}
 
-				// Inject MCP endpoint when enabled
-				if (resolvedConfig.mcp) {
+				// Inject MCP endpoint (always on — bearer-token-only, no cost if unused)
+				if (resolvedConfig.mcp !== false) {
 					injectMcpRoute(injectRoute);
-					logger.info("MCP server enabled at /_emdash/api/mcp");
 				}
 
 				// In playground mode, inject the playground middleware FIRST.
@@ -237,9 +490,28 @@ export function emdash(config: EmDashConfig = {}): AstroIntegration {
 					order: "pre",
 				});
 
-				printRoutesSummary(logger);
+				// Route info is printed with absolute, clickable URLs once the
+				// dev server is listening (see astro:server:setup), since the
+				// port isn't known yet here. Nothing useful to print for build.
 			},
 			"astro:server:setup": ({ server, logger }) => {
+				// Print route info with absolute, clickable URLs once the server
+				// is listening. Only in `astro dev` -- the dev-bypass shortcut is
+				// dev-only and the port is unknown until now.
+				if (astroCommand === "dev") {
+					server.httpServer?.once("listening", () => {
+						const address = server.httpServer?.address();
+						if (!address || typeof address === "string") return;
+						let host = address.address;
+						if (host === "::1" || host === "::" || host === "0.0.0.0") {
+							host = "localhost";
+						} else if (address.family === "IPv6") {
+							host = `[${host}]`;
+						}
+						printDevServerInfo(`http://${host}:${address.port}`, resolvedConfig.mcp !== false);
+					});
+				}
+
 				// Generate types once the server is listening.
 				// The endpoint returns the types content; we write the file here
 				// (in Node) because workerd has no real filesystem access.

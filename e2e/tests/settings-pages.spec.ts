@@ -40,8 +40,10 @@ test.describe("Social Settings", () => {
 			await expect(page.locator(`label:has-text("${label}")`)).toBeVisible({ timeout: 5000 });
 		}
 
-		// Save button should exist
-		await expect(page.locator("button", { hasText: "Save Social Links" })).toBeVisible();
+		// Save button should exist. Two are rendered (sticky header + bottom-of-form,
+		// both submit the same form via `form="social-settings-form"`); use .first()
+		// to avoid Playwright strict-mode locator violations.
+		await expect(page.locator("button", { hasText: "Save Social Links" }).first()).toBeVisible();
 	});
 
 	test("saves a social link and persists across reload", async ({ admin, page }) => {
@@ -64,8 +66,9 @@ test.describe("Social Settings", () => {
 			{ timeout: 15000 },
 		);
 
-		// Click save
-		await page.locator("button", { hasText: "Save Social Links" }).click();
+		// Click save. Two buttons match (sticky header + bottom-of-form); either
+		// submits the same form, so use .first() for strict-mode compatibility.
+		await page.locator("button", { hasText: "Save Social Links" }).first().click();
 		await saveResponse;
 
 		// Success banner should appear
@@ -114,8 +117,10 @@ test.describe("SEO Settings", () => {
 			await expect(page.locator(`label:has-text("${label}")`)).toBeVisible({ timeout: 5000 });
 		}
 
-		// Save button
-		await expect(page.locator("button", { hasText: "Save SEO Settings" })).toBeVisible();
+		// Save button. Two are rendered (sticky header + bottom-of-form, both submit
+		// the same form via `form="seo-settings-form"`); use .first() to avoid
+		// Playwright strict-mode locator violations.
+		await expect(page.locator("button", { hasText: "Save SEO Settings" }).first()).toBeVisible();
 	});
 
 	test("saves SEO settings and persists across reload", async ({ admin, page }) => {
@@ -141,8 +146,9 @@ test.describe("SEO Settings", () => {
 			{ timeout: 15000 },
 		);
 
-		// Click save
-		await page.locator("button", { hasText: "Save SEO Settings" }).click();
+		// Click save. Two buttons match (sticky header + bottom-of-form); either
+		// submits the same form, so use .first() for strict-mode compatibility.
+		await page.locator("button", { hasText: "Save SEO Settings" }).first().click();
 		await saveResponse;
 
 		// Success banner
@@ -162,6 +168,37 @@ test.describe("SEO Settings", () => {
 	});
 });
 
+test.describe("Language Switcher", () => {
+	test.beforeEach(async ({ admin }) => {
+		await admin.devBypassAuth();
+	});
+
+	test("settings page shows language select", async ({ admin, page }) => {
+		await admin.goto("/settings");
+		await admin.waitForShell();
+
+		const languageSelect = page.locator('[aria-label="Language"]');
+		await expect(languageSelect).toBeVisible();
+	});
+
+	test("switching language updates the UI", async ({ admin, page }) => {
+		await admin.goto("/settings");
+		await admin.waitForShell();
+
+		// Switch to German
+		await page.locator('[aria-label="Language"]').click();
+		await page.getByRole("option", { name: "Deutsch", exact: true }).click();
+
+		await expect(page.locator("h1")).toContainText("Einstellungen", { timeout: 5000 });
+
+		// Switch back — the select now shows "Deutsch" as its value
+		await page.locator("[role='combobox']", { hasText: "Deutsch" }).click();
+		await page.getByRole("option", { name: "English", exact: true }).click();
+
+		await expect(page.locator("h1")).toContainText("Settings", { timeout: 5000 });
+	});
+});
+
 test.describe("Email Settings", () => {
 	test.beforeEach(async ({ admin }) => {
 		await admin.devBypassAuth();
@@ -176,15 +213,6 @@ test.describe("Email Settings", () => {
 		await expect(page.locator("h1")).toContainText("Email Settings");
 
 		// Should show the Email Pipeline section
-		await expect(page.locator("text=Email Pipeline")).toBeVisible({ timeout: 10000 });
-	});
-
-	test("shows pipeline section without crashing", async ({ admin, page }) => {
-		await admin.goto("/settings/email");
-		await admin.waitForShell();
-		await admin.waitForLoading();
-
-		// The Email Pipeline section heading should be visible
 		await expect(page.getByRole("heading", { name: "Email Pipeline" })).toBeVisible({
 			timeout: 10000,
 		});

@@ -72,6 +72,20 @@ describe("RedirectRepository", () => {
 
 			expect(redirect.isPattern).toBe(false);
 		});
+
+		it("creates a 410 Gone rule with an empty destination", async () => {
+			const redirect = await repo.create({
+				source: "/deleted",
+				destination: "",
+				type: 410,
+			});
+
+			expect(redirect.type).toBe(410);
+			expect(redirect.destination).toBe("");
+
+			const fetched = await repo.findBySource("/deleted");
+			expect(fetched?.type).toBe(410);
+		});
 	});
 
 	describe("findById", () => {
@@ -248,6 +262,26 @@ describe("RedirectRepository", () => {
 			// limit=200 should clamp to 100
 			const max = await repo.findMany({ limit: 200 });
 			expect(max.items).toHaveLength(3); // only 3 exist
+		});
+	});
+
+	// --- findAllEnabled -----------------------------------------------------
+
+	describe("findAllEnabled", () => {
+		it("returns only enabled redirects", async () => {
+			await repo.create({ source: "/a", destination: "/b", enabled: true });
+			await repo.create({ source: "/c", destination: "/d", enabled: false });
+			await repo.create({ source: "/e", destination: "/f", enabled: true });
+
+			const result = await repo.findAllEnabled();
+			expect(result).toHaveLength(2);
+			expect(result.every((r) => r.enabled)).toBe(true);
+		});
+
+		it("returns empty array when no enabled redirects", async () => {
+			await repo.create({ source: "/a", destination: "/b", enabled: false });
+			const result = await repo.findAllEnabled();
+			expect(result).toHaveLength(0);
 		});
 	});
 
@@ -458,13 +492,15 @@ describe("RedirectRepository", () => {
 			expect(summary[1]!.count).toBe(1);
 		});
 
-		it("includes top referrer", async () => {
+		it("includes the most recently seen referrer", async () => {
+			// 404 rows are now deduped by path, so the stored referrer is the
+			// most recent one seen for that path rather than the most frequent.
 			await repo.log404({ path: "/x", referrer: "https://google.com" });
 			await repo.log404({ path: "/x", referrer: "https://google.com" });
 			await repo.log404({ path: "/x", referrer: "https://bing.com" });
 
 			const summary = await repo.get404Summary();
-			expect(summary[0]!.topReferrer).toBe("https://google.com");
+			expect(summary[0]!.topReferrer).toBe("https://bing.com");
 		});
 	});
 

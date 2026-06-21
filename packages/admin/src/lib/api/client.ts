@@ -3,6 +3,8 @@
  */
 
 import type { Element } from "@emdash-cms/blocks";
+import { i18n } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
 
 export const API_BASE = "/_emdash/api";
 
@@ -27,8 +29,8 @@ export async function throwResponseError(res: Response, fallback: string): Promi
 	if (typeof body === "object" && body !== null && "error" in body) {
 		const { error } = body;
 		if (typeof error === "object" && error !== null && "message" in error) {
-			const { message: msg } = error;
-			if (typeof msg === "string") message = msg;
+			const { message: errorMessage } = error;
+			if (typeof errorMessage === "string") message = errorMessage;
 		}
 	}
 	throw new Error(message || `${fallback}: ${res.statusText}`);
@@ -40,6 +42,11 @@ export async function throwResponseError(res: Response, fallback: string): Promi
 export interface FindManyResult<T> {
 	items: T[];
 	nextCursor?: string;
+	/**
+	 * Total number of rows matching the filters (ignoring pagination).
+	 * Optional because older servers may not return it.
+	 */
+	total?: number;
 }
 
 /**
@@ -47,6 +54,8 @@ export interface FindManyResult<T> {
  */
 export interface AdminManifest {
 	version: string;
+	/** Version of Astro the host is built with, when resolvable. */
+	astroVersion?: string;
 	hash: string;
 	collections: Record<
 		string,
@@ -55,14 +64,22 @@ export interface AdminManifest {
 			labelSingular: string;
 			supports: string[];
 			hasSeo: boolean;
+			urlPattern?: string;
 			fields: Record<
 				string,
 				{
+					/** Database row ID (ULID) for the field. Used to widen MIME allowlists on upload/media-list calls. */
+					id?: string;
 					kind: string;
 					label?: string;
 					required?: boolean;
 					widget?: string;
-					options?: Array<{ value: string; label: string }>;
+					/**
+					 * For `select` / `multiSelect`: the list of enum choices.
+					 * For `json` fields driven by a plugin `widget`: arbitrary widget config.
+					 */
+					options?: Array<{ value: string; label: string }> | Record<string, unknown>;
+					validation?: Record<string, unknown>;
 				}
 			>;
 		}
@@ -107,6 +124,7 @@ export interface AdminManifest {
 				description?: string;
 				placeholder?: string;
 				fields?: Element[];
+				category?: string;
 			}>;
 		}
 	>;
@@ -130,10 +148,43 @@ export interface AdminManifest {
 		locales: string[];
 	};
 	/**
+	 * Taxonomy definitions for the admin sidebar.
+	 */
+	taxonomies: Array<{
+		name: string;
+		label: string;
+		labelSingular?: string;
+		hierarchical: boolean;
+		collections: string[];
+	}>;
+	/**
 	 * Marketplace registry URL. Present when `marketplace` is configured
 	 * in the EmDash integration. Enables marketplace features in the UI.
 	 */
 	marketplace?: string;
+	/**
+	 * Experimental decentralized plugin registry. Present when
+	 * `experimental.registry` is configured in the EmDash integration.
+	 * When present, the admin UI uses the registry instead of the
+	 * centralized marketplace for browse and install.
+	 */
+	registry?: {
+		aggregatorUrl: string;
+		acceptLabelers?: string;
+		policy?: {
+			minimumReleaseAgeSeconds?: number;
+			minimumReleaseAgeExclude?: string[];
+		};
+	};
+	/**
+	 * Admin branding overrides for white-labeling.
+	 * Set via the `admin` config in `astro.config.mjs`.
+	 */
+	admin?: {
+		logo?: string;
+		siteName?: string;
+		favicon?: string;
+	};
 }
 
 /**
@@ -144,7 +195,7 @@ export interface AdminManifest {
  */
 export async function parseApiResponse<T>(
 	response: Response,
-	fallbackMessage = "Request failed",
+	fallbackMessage = i18n._(msg`Request failed`),
 ): Promise<T> {
 	if (!response.ok) await throwResponseError(response, fallbackMessage);
 	const body: { data: T } = await response.json();
@@ -156,5 +207,22 @@ export async function parseApiResponse<T>(
  */
 export async function fetchManifest(): Promise<AdminManifest> {
 	const response = await apiFetch(`${API_BASE}/manifest`);
-	return parseApiResponse<AdminManifest>(response, "Failed to fetch manifest");
+	return parseApiResponse<AdminManifest>(response, i18n._(msg`Failed to fetch manifest`));
+}
+
+/**
+ * Fetch auth mode (public endpoint — works without authentication).
+ * Used by the login page to determine which login UI to render.
+ */
+export async function fetchAuthMode(): Promise<{
+	authMode: string;
+	signupEnabled?: boolean;
+	providers?: Array<{ id: string; label: string }>;
+}> {
+	const response = await apiFetch(`${API_BASE}/auth/mode`);
+	return parseApiResponse<{
+		authMode: string;
+		signupEnabled?: boolean;
+		providers?: Array<{ id: string; label: string }>;
+	}>(response, i18n._(msg`Failed to fetch auth mode`));
 }

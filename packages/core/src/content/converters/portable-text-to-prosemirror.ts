@@ -35,13 +35,23 @@ export function portableTextToProsemirror(blocks: PortableTextBlock[]): ProseMir
 
 		// Check for list items
 		if (isTextBlock(block) && block.listItem) {
-			// Collect consecutive list items
+			// Collect a list "run": the level=1 anchor plus everything that
+			// nests under it (level > 1, regardless of listItem type — a number
+			// child under a bullet parent is still part of the same tree). A
+			// level=1 block with a different listItem ends the run. Without the
+			// `level > 1` carve-out the run breaks on the first nested type
+			// switch and the descendant subtree leaks out as its own top-level
+			// list (e.g. `[bullet L1, number L2, bullet L1]` would render as
+			// three sibling lists instead of one bullet list with a numbered
+			// child).
 			const listBlocks: PortableTextTextBlock[] = [];
 			const listType = block.listItem;
 
 			while (i < blocks.length) {
 				const current = blocks[i];
-				if (isTextBlock(current) && current.listItem === listType) {
+				if (!isTextBlock(current) || !current.listItem) break;
+				const level = current.level || 1;
+				if (level > 1 || current.listItem === listType) {
 					listBlocks.push(current);
 					i++;
 				} else {
@@ -73,10 +83,18 @@ function isTextBlock(block: PortableTextBlock): block is PortableTextTextBlock {
 }
 
 /**
- * Type guard for image blocks
+ * Type guard for image blocks.
+ * Checks both `_type` and that `asset` is a valid object — image blocks
+ * without an `asset` wrapper (e.g. `{ _type: "image", url: "..." }`) are
+ * malformed and should not be cast to `PortableTextImageBlock`.
  */
 function isImageBlock(block: PortableTextBlock): block is PortableTextImageBlock {
-	return block._type === "image";
+	return (
+		block._type === "image" &&
+		"asset" in block &&
+		typeof block.asset === "object" &&
+		block.asset !== null
+	);
 }
 
 /**
@@ -96,8 +114,19 @@ function convertBlock(block: PortableTextBlock): ProseMirrorNode | null {
 	if (isImageBlock(block)) {
 		return convertImage(block);
 	}
+	if (block._type === "image") {
+		// Malformed image block (no asset wrapper) — extract url from top level
+		return convertMalformedImage(block);
+	}
 	if (isCodeBlock(block)) {
 		return convertCodeBlock(block);
+	}
+	if (block._type === "htmlBlock") {
+		const hb = block as PortableTextBlock & { html?: string };
+		return {
+			type: "htmlBlock",
+			attrs: { html: hb.html || "" },
+		};
 	}
 	if (block._type === "break") {
 		return { type: "horizontalRule" };
@@ -218,20 +247,34 @@ function convertListItem(
 
 	// Handle nested items
 	if (nestedItems.length > 0) {
-		// Group nested items by their list type
-		let j = 0;
+		// The shallowest level in `nestedItems` is the effective root of this
+		// item's nested subtree. A new sub-list only starts when we hit
+		// another block at that root level with a different `listItem` type;
+		// deeper blocks (level > minLevel) belong to the current group as
+		// descendants regardless of their own `listItem`. The previous
+		// grouping broke on any type change at any depth, so a deep mixed
+		// tree like `bullet L1 → number L2 → bullet L3 → number L2` would
+		// emit C(L3) as a sibling list under A(L1) instead of nesting it
+		// under B(L2), then degrade C to L2 on round-trip.
+		let minLevel = Infinity;
+		for (const ni of nestedItems) {
+			const level = ni.level || 2;
+			if (level < minLevel) minLevel = level;
+		}
 
+		let j = 0;
 		while (j < nestedItems.length) {
-			const nestedListType = nestedItems[j].listItem || parentListType;
+			const anchorType: "bullet" | "number" = nestedItems[j].listItem || parentListType;
 			const nestedGroup: PortableTextTextBlock[] = [];
 
-			while (
-				j < nestedItems.length &&
-				(nestedItems[j].listItem || parentListType) === nestedListType
-			) {
+			do {
 				nestedGroup.push(nestedItems[j]);
 				j++;
-			}
+			} while (
+				j < nestedItems.length &&
+				((nestedItems[j].level || 2) > minLevel ||
+					(nestedItems[j].listItem || parentListType) === anchorType)
+			);
 
 			if (nestedGroup.length > 0) {
 				// Decrease level for nested conversion
@@ -239,7 +282,7 @@ function convertListItem(
 					...ni,
 					level: (ni.level || 2) - 1,
 				}));
-				content.push(convertList(adjustedGroup, nestedListType));
+				content.push(convertList(adjustedGroup, anchorType));
 			}
 		}
 	}
@@ -367,6 +410,42 @@ function convertImage(block: PortableTextImageBlock): ProseMirrorNode {
 			height: block.height,
 			displayWidth: block.displayWidth,
 			displayHeight: block.displayHeight,
+		},
+	};
+}
+
+/**
+ * Convert a malformed image block (missing `asset` wrapper) to ProseMirror.
+ * Handles blocks like `{ _type: "image", url: "...", alt: "..." }` that may
+ * originate from migrations or third-party imports.
+ */
+function convertMalformedImage(block: PortableTextBlock): ProseMirrorNode {
+	// PortableTextUnknownBlock allows indexed access via [key: string]: unknown
+	const url = "url" in block && typeof block.url === "string" ? block.url : "";
+	const alt = "alt" in block && typeof block.alt === "string" ? block.alt : "";
+	const caption = "caption" in block && typeof block.caption === "string" ? block.caption : "";
+	const width = "width" in block && typeof block.width === "number" ? block.width : undefined;
+	const height = "height" in block && typeof block.height === "number" ? block.height : undefined;
+	const displayWidth =
+		"displayWidth" in block && typeof block.displayWidth === "number"
+			? block.displayWidth
+			: undefined;
+	const displayHeight =
+		"displayHeight" in block && typeof block.displayHeight === "number"
+			? block.displayHeight
+			: undefined;
+	return {
+		type: "image",
+		attrs: {
+			src: url,
+			alt,
+			title: caption,
+			mediaId: undefined,
+			provider: undefined,
+			width,
+			height,
+			displayWidth,
+			displayHeight,
 		},
 	};
 }

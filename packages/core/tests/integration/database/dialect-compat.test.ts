@@ -10,13 +10,15 @@
 
 import { it, expect, beforeEach, afterEach } from "vitest";
 
-import { runMigrations, getMigrationStatus } from "../../../src/database/migrations/runner.js";
+import { MIGRATION_COUNT } from "../../../src/database/migrations/runner.js";
 import { ContentRepository } from "../../../src/database/repositories/content.js";
 import type { Database } from "../../../src/database/types.js";
 import { SchemaRegistry } from "../../../src/schema/registry.js";
 import {
 	createForDialect,
 	describeEachDialect,
+	getMigrationStatusForDialect,
+	runMigrationsForDialect,
 	setupForDialect,
 	setupForDialectWithCollections,
 	teardownForDialect,
@@ -40,7 +42,7 @@ describeEachDialect("Migrations", (dialect) => {
 	});
 
 	it("runs all migrations and creates system tables", async () => {
-		await runMigrations(ctx.db);
+		await runMigrationsForDialect(ctx);
 
 		const tables = [
 			"revisions",
@@ -59,6 +61,9 @@ describeEachDialect("Migrations", (dialect) => {
 			"_emdash_sections",
 			"_emdash_bylines",
 			"_emdash_content_bylines",
+			"_emdash_byline_fields",
+			"_emdash_byline_field_values",
+			"_emdash_byline_field_group_values",
 		];
 
 		for (const table of tables) {
@@ -71,31 +76,31 @@ describeEachDialect("Migrations", (dialect) => {
 	});
 
 	it("tracks migrations in _emdash_migrations", async () => {
-		await runMigrations(ctx.db);
+		await runMigrationsForDialect(ctx);
 
 		const migrations = await ctx.db.selectFrom("_emdash_migrations").selectAll().execute();
 
-		expect(migrations).toHaveLength(31);
+		expect(migrations).toHaveLength(MIGRATION_COUNT);
 		expect(migrations[0]?.name).toBe("001_initial");
 	});
 
 	it("is idempotent", async () => {
-		await runMigrations(ctx.db);
-		await runMigrations(ctx.db);
+		await runMigrationsForDialect(ctx);
+		await runMigrationsForDialect(ctx);
 
 		const migrations = await ctx.db.selectFrom("_emdash_migrations").selectAll().execute();
 
-		expect(migrations).toHaveLength(31);
+		expect(migrations).toHaveLength(MIGRATION_COUNT);
 	});
 
 	it("reports correct migration status", async () => {
-		const before = await getMigrationStatus(ctx.db);
+		const before = await getMigrationStatusForDialect(ctx);
 		expect(before.pending).toContain("001_initial");
 		expect(before.applied).toHaveLength(0);
 
-		await runMigrations(ctx.db);
+		await runMigrationsForDialect(ctx);
 
-		const after = await getMigrationStatus(ctx.db);
+		const after = await getMigrationStatusForDialect(ctx);
 		expect(after.applied).toContain("001_initial");
 		expect(after.pending).toHaveLength(0);
 	});
@@ -111,7 +116,7 @@ describeEachDialect("Schema registry", (dialect) => {
 
 	beforeEach(async () => {
 		ctx = await setupForDialect(dialect);
-		await runMigrations(ctx.db);
+		await runMigrationsForDialect(ctx);
 		registry = new SchemaRegistry(ctx.db);
 	});
 

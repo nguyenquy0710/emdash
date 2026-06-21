@@ -17,6 +17,13 @@
 import { defineMiddleware } from "astro:middleware";
 
 import { RedirectRepository } from "../../database/repositories/redirect.js";
+import { getDb } from "../../loader.js";
+import {
+	getCachedRedirects,
+	matchCachedPatterns,
+	setCachedRedirects,
+} from "../../redirects/cache.js";
+import { isTerminalStatus } from "../../redirects/status.js";
 
 /** Paths that should never be intercepted by redirects */
 const SKIP_PREFIXES = ["/_emdash", "/_image"];
@@ -41,28 +48,65 @@ export const onRequest = defineMiddleware(async (context, next) => {
 		return next();
 	}
 
-	const { emdash } = context.locals;
-	if (!emdash?.db) {
-		return next();
+	// Public visitors hit the runtime's anonymous fast path, which intentionally
+	// omits `db` from `locals.emdash` to keep the public render boundary minimal
+	// (issue #808). Fall back to `getDb()`, which transparently returns the
+	// per-request scoped db (set in ALS by the runtime middleware) or the
+	// singleton — same path the loader and template helpers use.
+	let db = context.locals.emdash?.db;
+	if (!db) {
+		try {
+			db = await getDb();
+		} catch {
+			return next();
+		}
 	}
 
 	try {
-		const repo = new RedirectRepository(emdash.db);
-		const match = await repo.matchPath(pathname);
+		const repo = new RedirectRepository(db);
 
-		if (match) {
-			// Reject protocol-relative URLs (e.g. //evil.com or /\evil.com) from interpolation.
-			// Browsers normalize backslashes to forward slashes, so /\ is equivalent to //.
-			if (
-				match.resolvedDestination.startsWith("//") ||
-				match.resolvedDestination.startsWith("/\\")
-			) {
-				return next();
+		// One query loads both exact and pattern rules into the cache; warm
+		// requests issue zero queries. Empty-redirect sites cache an empty
+		// Map + array, so the next request returns immediately without probing.
+		let cached = getCachedRedirects();
+		if (!cached) {
+			const all = await repo.findAllEnabled();
+			cached = setCachedRedirects(all);
+		}
+
+		// 1. Exact match (O(1) Map lookup)
+		let exact = cached.exact.get(pathname);
+		if (!exact && pathname.length > 1) {
+			const alt = pathname.endsWith("/") ? pathname.slice(0, -1) : `${pathname}/`;
+			exact = cached.exact.get(alt);
+		}
+		if (exact) {
+			// Terminal statuses (410 Gone / 451): serve the status directly,
+			// with no Location header.
+			if (isTerminalStatus(exact.type)) {
+				repo.recordHit(exact.id).catch(() => {});
+				return new Response(null, { status: exact.type });
 			}
-			// Fire-and-forget hit recording (don't block the redirect)
-			repo.recordHit(match.redirect.id).catch(() => {});
-			const code = isRedirectCode(match.redirect.type) ? match.redirect.type : 301;
-			return context.redirect(match.resolvedDestination, code);
+			const dest = exact.destination;
+			if (dest.startsWith("//") || dest.startsWith("/\\")) return next();
+			repo.recordHit(exact.id).catch(() => {});
+			const code = isRedirectCode(exact.type) ? exact.type : 301;
+			return context.redirect(dest, code);
+		}
+
+		// 2. Pattern match (compile once, match every request)
+		const patternMatch = matchCachedPatterns(cached.patterns, pathname);
+		if (patternMatch) {
+			const { redirect, destination } = patternMatch;
+			// Terminal statuses (410 Gone / 451): serve the status directly.
+			if (isTerminalStatus(redirect.type)) {
+				repo.recordHit(redirect.id).catch(() => {});
+				return new Response(null, { status: redirect.type });
+			}
+			if (destination.startsWith("//") || destination.startsWith("/\\")) return next();
+			repo.recordHit(redirect.id).catch(() => {});
+			const code = isRedirectCode(redirect.type) ? redirect.type : 301;
+			return context.redirect(destination, code);
 		}
 
 		// No redirect matched -- proceed and check for 404

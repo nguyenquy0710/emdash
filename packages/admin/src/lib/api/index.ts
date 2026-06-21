@@ -13,6 +13,7 @@ export {
 	type FindManyResult,
 	type AdminManifest,
 	fetchManifest,
+	fetchAuthMode,
 } from "./client.js";
 
 // Content CRUD and revisions
@@ -30,6 +31,9 @@ export {
 	type TranslationsResponse,
 	getDraftStatus,
 	fetchContentList,
+	fetchContentAuthors,
+	type ContentAuthor,
+	type ContentDateField,
 	fetchContent,
 	fetchTranslations,
 	createContent,
@@ -57,7 +61,9 @@ export {
 	type MediaProviderCapabilities,
 	type MediaProviderInfo,
 	type MediaProviderItem,
+	MEDIA_SEARCH_MAX_LENGTH,
 	fetchMediaList,
+	fetchMediaItem,
 	uploadMedia,
 	deleteMedia,
 	updateMedia,
@@ -114,6 +120,7 @@ export {
 	type CreateAllowedDomainInput,
 	type UpdateAllowedDomainInput,
 	type SignupVerifyResult,
+	type InviteVerifyResult,
 	fetchUsers,
 	fetchUser,
 	updateUser,
@@ -121,6 +128,7 @@ export {
 	disableUser,
 	enableUser,
 	inviteUser,
+	validateInviteToken,
 	fetchPasskeys,
 	renamePasskey,
 	deletePasskey,
@@ -138,24 +146,47 @@ export {
 export {
 	type BylineSummary,
 	type BylineInput,
+	type BylineTranslationInput,
 	type BylineCreditInput,
+	type BylineCustomFieldValue,
 	fetchBylines,
 	fetchByline,
 	createByline,
 	updateByline,
 	deleteByline,
+	fetchBylineTranslations,
+	createBylineTranslation,
 } from "./bylines.js";
+
+// Byline custom-field schema (Discussion #1174)
+export {
+	type BylineFieldType,
+	type BylineFieldValidation,
+	type BylineFieldDefinition,
+	type BylineFieldUsage,
+	type CreateBylineFieldInput,
+	type UpdateBylineFieldInput,
+	listBylineFields,
+	getBylineFieldUsage,
+	createBylineField,
+	updateBylineField,
+	deleteBylineField,
+	reorderBylineFields,
+} from "./byline-fields.js";
 
 // Menus
 export {
 	type Menu,
 	type MenuItem,
 	type MenuWithItems,
+	type MenuTranslation,
+	type MenuTranslationsResponse,
 	type CreateMenuInput,
 	type UpdateMenuInput,
 	type CreateMenuItemInput,
 	type UpdateMenuItemInput,
 	type ReorderMenuItemsInput,
+	type LocaleOptions as MenuLocaleOptions,
 	fetchMenus,
 	fetchMenu,
 	createMenu,
@@ -165,6 +196,8 @@ export {
 	updateMenuItem,
 	deleteMenuItem,
 	reorderMenuItems,
+	fetchMenuTranslations,
+	createMenuTranslation,
 } from "./menus.js";
 
 // Widget areas
@@ -205,6 +238,8 @@ export {
 export {
 	type TaxonomyTerm,
 	type TaxonomyDef,
+	type TermTranslation,
+	type TermTranslationsResponse,
 	type CreateTaxonomyInput,
 	type CreateTermInput,
 	type UpdateTermInput,
@@ -215,6 +250,8 @@ export {
 	createTerm,
 	updateTerm,
 	deleteTerm,
+	fetchTermTranslations,
+	createTermTranslation,
 } from "./taxonomies.js";
 
 // WordPress import
@@ -257,6 +294,7 @@ export {
 	type ApiTokenInfo,
 	type ApiTokenCreateResult,
 	type CreateApiTokenInput,
+	type ApiTokenScopeValue,
 	API_TOKEN_SCOPES,
 	fetchApiTokens,
 	createApiToken,

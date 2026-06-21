@@ -1,27 +1,30 @@
 import {
 	Badge,
 	Button,
+	Checkbox,
 	Dialog,
 	Input,
 	InputArea,
 	Label,
+	LinkButton,
 	Loader,
 	Select,
 	Switch,
-	buttonVariants,
 } from "@cloudflare/kumo";
+import { useLingui } from "@lingui/react/macro";
 import {
-	ArrowLeft,
 	Check,
 	Eye,
-	Image as ImageIcon,
 	MagnifyingGlass,
+	Paperclip,
 	X,
 	Trash,
 	ArrowsInSimple,
 	ArrowsOutSimple,
+	ArrowSquareOut,
 } from "@phosphor-icons/react";
-import { Link } from "@tanstack/react-router";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import type { Editor } from "@tiptap/react";
 import * as React from "react";
 
@@ -33,12 +36,20 @@ import type {
 	UserListItem,
 	TranslationSummary,
 } from "../lib/api";
-import { getPreviewUrl, getDraftStatus } from "../lib/api";
+import { fetchBylines, getPreviewUrl, getDraftStatus } from "../lib/api";
+import { fromDatetimeLocalInputValue, toDatetimeLocalInputValue } from "../lib/datetime-local.js";
+import { useDebouncedValue } from "../lib/hooks.js";
+import { formatFileSize, getFileIcon } from "../lib/media-utils";
 import { usePluginAdmins } from "../lib/plugin-context.js";
+import { contentUrl, isSafeUrl } from "../lib/url.js";
 import { cn, slugify } from "../lib/utils";
+import { ArrowPrev } from "./ArrowIcons.js";
 import { BlockKitFieldWidget } from "./BlockKitFieldWidget.js";
 import { DocumentOutline } from "./editor/DocumentOutline";
+import { ImageFieldRenderer, type ImageFieldValue } from "./ImageFieldRenderer.js";
 import { PluginFieldErrorBoundary } from "./PluginFieldErrorBoundary.js";
+import { RepeaterField } from "./RepeaterField.js";
+import { RouterLinkButton } from "./RouterLinkButton.js";
 
 /** Autosave debounce delay in milliseconds */
 const AUTOSAVE_DELAY = 2000;
@@ -68,16 +79,23 @@ import { RevisionHistory } from "./RevisionHistory";
 import { SaveButton } from "./SaveButton";
 import { SeoPanel } from "./SeoPanel";
 import { TaxonomySidebar } from "./TaxonomySidebar";
+import { TranslationsPanel } from "./TranslationsPanel.js";
 
 // Editor role level (40) from @emdash-cms/auth
 const ROLE_EDITOR = 40;
 
 export interface FieldDescriptor {
+	id?: string;
 	kind: string;
 	label?: string;
 	required?: boolean;
-	options?: Array<{ value: string; label: string }>;
+	/**
+	 * For `select` / `multiSelect`: the list of enum choices.
+	 * For `json` fields driven by a plugin `widget`: arbitrary widget config.
+	 */
+	options?: Array<{ value: string; label: string }> | Record<string, unknown>;
 	widget?: string;
+	validation?: Record<string, unknown>;
 }
 
 /** Simplified user info for current user context */
@@ -92,6 +110,13 @@ export interface ContentEditorProps {
 	item?: ContentItem | null;
 	fields: Record<string, FieldDescriptor>;
 	isNew?: boolean;
+	/**
+	 * Locale this entry is bound to. For existing entries this matches
+	 * `item.locale`; for new entries it's the URL `?locale=` (or default).
+	 * Threaded into the byline picker so the empty-state CTA links to the
+	 * right locale on the Bylines manager.
+	 */
+	entryLocale?: string | null;
 	isSaving?: boolean;
 	onSave?: (payload: {
 		data: Record<string, unknown>;
@@ -122,6 +147,8 @@ export interface ContentEditorProps {
 	supportsDrafts?: boolean;
 	/** Whether this collection supports revisions */
 	supportsRevisions?: boolean;
+	/** Whether this collection supports preview */
+	supportsPreview?: boolean;
 	/** Current user (for permission checks) */
 	currentUser?: CurrentUserInfo;
 	/** Available users for author selection (only shown to editors+) */
@@ -130,6 +157,8 @@ export interface ContentEditorProps {
 	onAuthorChange?: (authorId: string | null) => void;
 	/** Available byline profiles */
 	availableBylines?: BylineSummary[];
+	/** Whether the parent's byline picker query has resolved. Suppresses the empty-state flash before first fetch. */
+	availableBylinesLoaded?: boolean;
 	/** Selected byline credits (controlled for new entries) */
 	selectedBylines?: BylineCreditInput[];
 	/** Callback when byline credits are changed */
@@ -177,6 +206,7 @@ export function ContentEditor({
 	item,
 	fields,
 	isNew,
+	entryLocale,
 	isSaving,
 	onSave,
 	onAutosave,
@@ -190,10 +220,12 @@ export function ContentEditor({
 	isScheduling,
 	supportsDrafts = false,
 	supportsRevisions = false,
+	supportsPreview = false,
 	currentUser,
 	users,
 	onAuthorChange,
 	availableBylines,
+	availableBylinesLoaded,
 	selectedBylines,
 	onBylinesChange,
 	onQuickCreateByline,
@@ -208,6 +240,8 @@ export function ContentEditor({
 	onSeoChange,
 	manifest,
 }: ContentEditorProps) {
+	const { t } = useLingui();
+	const navigate = useNavigate();
 	const [formData, setFormData] = React.useState<Record<string, unknown>>(item?.data || {});
 	const [slug, setSlug] = React.useState(item?.slug || "");
 	const [slugTouched, setSlugTouched] = React.useState(!!item?.slug);
@@ -216,8 +250,14 @@ export function ContentEditor({
 		item?.bylines?.map((entry) => ({ bylineId: entry.byline.id, roleLabel: entry.roleLabel })) ??
 			[],
 	);
+	// Gates whether `bylines` is included in the save payload. Untouched
+	// edits must not ship `[]` — strict per-locale hydration can return
+	// empty for entries with credits at other locales, and sending `[]`
+	// would wipe them.
+	const [bylinesTouched, setBylinesTouched] = React.useState(false);
 
-	// Track portableText editor for document outline
+	// Track portableText editor for document outline. Only the "content"
+	// field wires its editor into this slot (see onEditorReady below).
 	const [portableTextEditor, setPortableTextEditor] = React.useState<Editor | null>(null);
 
 	// Block sidebar state – when a block (e.g. image) requests sidebar space, this holds
@@ -236,6 +276,13 @@ export function ContentEditor({
 		});
 	}, []);
 
+	const handleSeoChange = React.useCallback(
+		(seo: ContentSeoInput) => {
+			onSeoChange?.(seo);
+		},
+		[onSeoChange],
+	);
+
 	// Track the last saved state to determine if dirty
 	const [lastSavedData, setLastSavedData] = React.useState<string>(
 		serializeEditorState({
@@ -248,6 +295,41 @@ export function ContentEditor({
 				})) ?? [],
 		}),
 	);
+	const pendingAutosaveStateRef = React.useRef<string | null>(null);
+
+	// Synchronously reset form state when the underlying item changes (e.g. a
+	// translation switch where TanStack Router keeps ContentEditor mounted but
+	// swaps `item` for a different id). The post-render useEffect below also
+	// syncs item -> formData, but it runs *after* the first render with the new
+	// item, leaving children (notably PortableTextEditor, which freezes its
+	// initial content on mount) one render behind. This is the React-recommended
+	// "store info from previous renders" idiom -- see
+	// https://react.dev/reference/react/useState#storing-information-from-previous-renders
+	//
+	// We also reset lastSavedData here (not just in the post-render effect) so
+	// that isDirty stays false through the switch -- otherwise SaveButton would
+	// briefly flip from "Saved" -> "Save" -> "Saved" within a single tick.
+	const [previousItemId, setPreviousItemId] = React.useState<string | null>(item?.id ?? null);
+	if (item && item.id !== previousItemId) {
+		setPreviousItemId(item.id);
+		setFormData(item.data);
+		setSlug(item.slug || "");
+		setSlugTouched(!!item.slug);
+		setStatus(item.status);
+		const nextBylines =
+			item.bylines?.map((entry) => ({ bylineId: entry.byline.id, roleLabel: entry.roleLabel })) ??
+			[];
+		setInternalBylines(nextBylines);
+		setLastSavedData(
+			serializeEditorState({
+				data: item.data,
+				slug: item.slug || "",
+				bylines: nextBylines,
+			}),
+		);
+		pendingAutosaveStateRef.current = null;
+		setBylinesTouched(false);
+	}
 
 	// Update form and last saved state when item changes (e.g., after save or restore)
 	// Stringify the data for comparison since objects are compared by reference
@@ -273,6 +355,8 @@ export function ContentEditor({
 						})) ?? [],
 				}),
 			);
+			pendingAutosaveStateRef.current = null;
+			setBylinesTouched(false);
 		}
 	}, [item?.updatedAt, itemDataString, item?.slug, item?.status]);
 
@@ -280,6 +364,7 @@ export function ContentEditor({
 
 	const handleBylinesChange = React.useCallback(
 		(next: BylineCreditInput[]) => {
+			setBylinesTouched(true);
 			if (isNew) {
 				onBylinesChange?.(next);
 				return;
@@ -311,6 +396,28 @@ export function ContentEditor({
 	slugRef.current = slug;
 
 	React.useEffect(() => {
+		if (!lastAutosaveAt || !pendingAutosaveStateRef.current) {
+			return;
+		}
+
+		setLastSavedData(pendingAutosaveStateRef.current);
+		pendingAutosaveStateRef.current = null;
+	}, [lastAutosaveAt]);
+
+	const hasInvalidUrls = React.useCallback(
+		(data: Record<string, unknown>) => {
+			for (const [name, field] of Object.entries(fields)) {
+				if (field.kind === "url") {
+					const val = typeof data[name] === "string" ? data[name].trim() : "";
+					if (val && !isValidUrl(val)) return true;
+				}
+			}
+			return false;
+		},
+		[fields],
+	);
+
+	React.useEffect(() => {
 		// Don't autosave for new items (no ID yet) or if autosave isn't configured
 		if (isNew || !onAutosave || !item?.id) {
 			return;
@@ -328,11 +435,22 @@ export function ContentEditor({
 
 		// Schedule autosave
 		autosaveTimeoutRef.current = setTimeout(() => {
-			onAutosave({
+			if (hasInvalidUrls(formDataRef.current)) return;
+			const payload: {
+				data: Record<string, unknown>;
+				slug?: string;
+				bylines?: BylineCreditInput[];
+			} = {
 				data: formDataRef.current,
 				slug: slugRef.current || undefined,
+			};
+			if (bylinesTouched) payload.bylines = activeBylines;
+			pendingAutosaveStateRef.current = serializeEditorState({
+				data: payload.data,
+				slug: payload.slug || "",
 				bylines: activeBylines,
 			});
+			onAutosave(payload);
 		}, AUTOSAVE_DELAY);
 
 		return () => {
@@ -340,25 +458,44 @@ export function ContentEditor({
 				clearTimeout(autosaveTimeoutRef.current);
 			}
 		};
-	}, [currentData, isNew, onAutosave, item?.id, isDirty, isSaving, isAutosaving, activeBylines]);
+	}, [
+		currentData,
+		isNew,
+		onAutosave,
+		item?.id,
+		isDirty,
+		isSaving,
+		isAutosaving,
+		activeBylines,
+		bylinesTouched,
+		hasInvalidUrls,
+	]);
 
 	// Cancel pending autosave on manual save
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
+		if (hasInvalidUrls(formData)) return;
 		// Cancel pending autosave
 		if (autosaveTimeoutRef.current) {
 			clearTimeout(autosaveTimeoutRef.current);
 			autosaveTimeoutRef.current = null;
 		}
-		onSave?.({
+		const payload: {
+			data: Record<string, unknown>;
+			slug?: string;
+			bylines?: BylineCreditInput[];
+		} = {
 			data: formData,
 			slug: slug || undefined,
-			bylines: activeBylines,
-		});
+		};
+		if (isNew || bylinesTouched) payload.bylines = activeBylines;
+		onSave?.(payload);
 	};
 
 	// Preview URL state
 	const [isLoadingPreview, setIsLoadingPreview] = React.useState(false);
+
+	const urlPattern = manifest?.collections[collection]?.urlPattern;
 
 	const handlePreview = async () => {
 		if (!item?.id) return;
@@ -367,15 +504,20 @@ export function ContentEditor({
 		try {
 			const result = await getPreviewUrl(collection, item.id);
 			if (result?.url) {
-				// Open preview in new tab
 				window.open(result.url, "_blank", "noopener,noreferrer");
 			} else {
-				// Fallback to direct URL if preview not configured
-				window.open(`/${collection}/${slug || item.id}`, "_blank", "noopener,noreferrer");
+				window.open(
+					contentUrl(collection, slug || item.id, urlPattern),
+					"_blank",
+					"noopener,noreferrer",
+				);
 			}
 		} catch {
-			// Fallback to direct URL on error
-			window.open(`/${collection}/${slug || item?.id}`, "_blank", "noopener,noreferrer");
+			window.open(
+				contentUrl(collection, slug || item?.id || "", urlPattern),
+				"_blank",
+				"noopener,noreferrer",
+			);
 		} finally {
 			setIsLoadingPreview(false);
 		}
@@ -450,38 +592,42 @@ export function ContentEditor({
 				isDistractionFree && "fixed inset-0 z-50 bg-kumo-base p-8 overflow-auto",
 			)}
 		>
-			{/* Header - show on hover in distraction-free mode */}
+			{/* Header. In distraction-free mode this becomes a hover-revealed
+			    overlay so the chrome stays out of the way while writing. In
+			    normal mode it's a regular block; the form also renders a
+			    Save button at the bottom so save is reachable without
+			    scrolling back up. */}
 			<div
 				className={cn(
 					"flex flex-wrap items-center justify-between gap-y-2",
 					isDistractionFree &&
-						"opacity-0 hover:opacity-100 transition-opacity duration-200 fixed top-0 left-0 right-0 bg-kumo-base/95 backdrop-blur p-4 z-10",
+						"opacity-0 hover:opacity-100 transition-opacity duration-200 fixed top-0 start-0 end-0 bg-kumo-base/95 backdrop-blur p-4 z-10",
 				)}
 			>
 				<div className="flex items-center space-x-4">
 					{!isDistractionFree && (
-						<Link
+						<RouterLinkButton
 							to="/content/$collection"
 							params={{ collection }}
 							search={{ locale: undefined }}
-							aria-label={`Back to ${collectionLabel} list`}
-							className={buttonVariants({ variant: "ghost", shape: "square" })}
-						>
-							<ArrowLeft className="h-5 w-5" aria-hidden="true" />
-						</Link>
+							aria-label={t`Back to ${collectionLabel} list`}
+							variant="ghost"
+							shape="square"
+							icon={<ArrowPrev />}
+						/>
 					)}
 					{isDistractionFree && (
 						<Button
 							variant="ghost"
 							shape="square"
 							onClick={() => setIsDistractionFree(false)}
-							aria-label="Exit distraction-free mode"
+							aria-label={t`Exit distraction-free mode`}
 						>
 							<ArrowsInSimple className="h-5 w-5" aria-hidden="true" />
 						</Button>
 					)}
 					<h1 className="text-2xl font-bold">
-						{isNew ? `New ${collectionLabel}` : `Edit ${collectionLabel}`}
+						{isNew ? t`New ${collectionLabel}` : t`Edit ${collectionLabel}`}
 					</h1>
 					{i18n && item?.locale && (
 						<Badge variant="outline" className="uppercase text-xs">
@@ -492,16 +638,21 @@ export function ContentEditor({
 				<div className="flex items-center space-x-2">
 					{/* Autosave indicator */}
 					{!isNew && onAutosave && (
-						<div className="flex items-center text-xs text-kumo-subtle">
+						<div
+							className="flex items-center text-xs text-kumo-subtle"
+							role="status"
+							aria-label={t`Autosave status`}
+							aria-live="polite"
+						>
 							{isAutosaving ? (
 								<>
 									<Loader size="sm" />
-									<span className="ml-1">Saving...</span>
+									<span className="ms-1">{t`Saving...`}</span>
 								</>
 							) : lastAutosaveAt ? (
 								<>
-									<Check className="mr-1 h-3 w-3 text-green-600" aria-hidden="true" />
-									<span>Saved</span>
+									<Check className="me-1 h-3 w-3 text-green-600" aria-hidden="true" />
+									<span>{t`Saved`}</span>
 								</>
 							) : null}
 						</div>
@@ -512,13 +663,13 @@ export function ContentEditor({
 							shape="square"
 							type="button"
 							onClick={() => setIsDistractionFree(true)}
-							aria-label="Enter distraction-free mode"
-							title="Distraction-free mode (⌘⇧\)"
+							aria-label={t`Enter distraction-free mode`}
+							title={t`Distraction-free mode (⌘⇧\\)`}
 						>
 							<ArrowsOutSimple className="h-4 w-4" aria-hidden="true" />
 						</Button>
 					)}
-					{!isNew && (
+					{!isNew && supportsPreview && (
 						<Button
 							variant="outline"
 							type="button"
@@ -526,40 +677,40 @@ export function ContentEditor({
 							disabled={isLoadingPreview}
 							icon={isLoadingPreview ? <Loader size="sm" /> : <Eye />}
 						>
-							{hasPendingChanges ? "Preview draft" : "Preview"}
+							{hasPendingChanges ? t`Preview draft` : t`Preview`}
 						</Button>
 					)}
 					<SaveButton type="submit" isDirty={isDirty} isSaving={isSaving || false} />
 					{!isNew && (
 						<>
 							{supportsDrafts && hasPendingChanges && onDiscardDraft && (
-								<Dialog.Root disablePointerDismissal>
+								<Dialog.Root>
 									<Dialog.Trigger
 										render={(p) => (
-											<Button {...p} type="button" variant="outline" size="sm" icon={<X />}>
-												Discard changes
+											<Button {...p} type="button" variant="outline" icon={<X />}>
+												{t`Discard changes`}
 											</Button>
 										)}
 									/>
 									<Dialog className="p-6" size="sm">
 										<Dialog.Title className="text-lg font-semibold">
-											Discard draft changes?
+											{t`Discard draft changes?`}
 										</Dialog.Title>
 										<Dialog.Description className="text-kumo-subtle">
-											This will revert to the published version. Your draft changes will be lost.
+											{t`This will revert to the published version. Your draft changes will be lost.`}
 										</Dialog.Description>
 										<div className="mt-6 flex justify-end gap-2">
 											<Dialog.Close
 												render={(p) => (
 													<Button {...p} variant="secondary">
-														Cancel
+														{t`Cancel`}
 													</Button>
 												)}
 											/>
 											<Dialog.Close
 												render={(p) => (
 													<Button {...p} variant="destructive" onClick={onDiscardDraft}>
-														Discard changes
+														{t`Discard changes`}
 													</Button>
 												)}
 											/>
@@ -571,18 +722,28 @@ export function ContentEditor({
 								<>
 									{hasPendingChanges ? (
 										<Button type="button" variant="primary" onClick={onPublish}>
-											Publish changes
+											{t`Publish changes`}
 										</Button>
 									) : (
 										<Button type="button" variant="outline" onClick={onUnpublish}>
-											Unpublish
+											{t`Unpublish`}
 										</Button>
 									)}
 								</>
 							) : (
 								<Button type="button" variant="secondary" onClick={onPublish}>
-									Publish
+									{t`Publish`}
 								</Button>
+							)}
+							{isLive && item?.slug && (
+								<LinkButton
+									href={contentUrl(collection, item.slug, urlPattern)}
+									external
+									variant="outline"
+									icon={<ArrowSquareOut />}
+								>
+									{t`Live View`}
+								</LinkButton>
 							)}
 						</>
 					)}
@@ -605,27 +766,50 @@ export function ContentEditor({
 						)}
 					>
 						<div className="space-y-4">
-							{Object.entries(fields).map(([name, field]) => (
-								<FieldRenderer
-									key={name}
-									name={name}
-									field={field}
-									value={formData[name]}
-									onChange={handleFieldChange}
-									onEditorReady={field.kind === "portableText" ? setPortableTextEditor : undefined}
-									minimal={isDistractionFree}
-									pluginBlocks={pluginBlocks}
-									onBlockSidebarOpen={
-										field.kind === "portableText" ? handleBlockSidebarOpen : undefined
-									}
-									onBlockSidebarClose={
-										field.kind === "portableText" ? handleBlockSidebarClose : undefined
-									}
-									manifest={manifest}
-								/>
-							))}
+							{Object.entries(fields).map(([name, field]) => {
+								// Key by item id so all field editors remount cleanly when the
+								// underlying content item changes (e.g. switching translations).
+								// PortableTextEditor in particular freezes its initial content on
+								// mount; without this key, navigating between translations leaves
+								// the previous locale's body in the editor and silently overwrites
+								// the new translation on the next edit.
+								const fieldKey = `${name}:${item?.id ?? "new"}`;
+								const fieldEl = (
+									<FieldRenderer
+										key={fieldKey}
+										name={name}
+										field={field}
+										value={formData[name]}
+										onChange={handleFieldChange}
+										onEditorReady={
+											field.kind === "portableText" && name === "content"
+												? setPortableTextEditor
+												: undefined
+										}
+										minimal={isDistractionFree}
+										pluginBlocks={pluginBlocks}
+										onBlockSidebarOpen={
+											field.kind === "portableText" ? handleBlockSidebarOpen : undefined
+										}
+										onBlockSidebarClose={
+											field.kind === "portableText" ? handleBlockSidebarClose : undefined
+										}
+										manifest={manifest}
+									/>
+								);
+								return fieldEl;
+							})}
 						</div>
 					</div>
+
+					{/* Save action at the bottom of the main column so users hit it
+					    naturally when they finish editing, without needing to scroll
+					    past the entire sidebar. */}
+					{!isDistractionFree && (
+						<div className="flex justify-end">
+							<SaveButton type="submit" isDirty={isDirty} isSaving={isSaving || false} />
+						</div>
+					)}
 				</div>
 
 				{/* Sidebar - hidden in distraction-free mode */}
@@ -654,23 +838,25 @@ export function ContentEditor({
 						<div className="rounded-lg border bg-kumo-base flex flex-col">
 							{/* Publish settings */}
 							<div className="p-4">
-								<h3 className="mb-4 font-semibold">Publish</h3>
+								<h3 className="mb-4 font-semibold">{t`Publish`}</h3>
 								<div className="space-y-4">
 									<Input
-										label="Slug"
+										label={t`Slug`}
 										value={slug}
 										onChange={(e) => handleSlugChange(e.target.value)}
 										placeholder="my-post-slug"
 									/>
 									<div>
-										<Label>Status</Label>
+										<Label>{t`Status`}</Label>
 										<div className="mt-1 flex flex-wrap items-center gap-1.5">
 											{supportsDrafts ? (
 												<>
-													{isLive && <Badge variant="primary">Published</Badge>}
-													{hasPendingChanges && <Badge variant="secondary">Pending changes</Badge>}
-													{!isLive && !hasSchedule && <Badge variant="secondary">Draft</Badge>}
-													{hasSchedule && <Badge variant="outline">Scheduled</Badge>}
+													{isLive && <Badge variant="success">{t`Published`}</Badge>}
+													{hasPendingChanges && (
+														<Badge variant="secondary">{t`Pending changes`}</Badge>
+													)}
+													{!isLive && !hasSchedule && <Badge variant="secondary">{t`Draft`}</Badge>}
+													{hasSchedule && <Badge variant="outline">{t`Scheduled`}</Badge>}
 												</>
 											) : (
 												<span className="text-sm text-kumo-subtle">
@@ -680,11 +866,9 @@ export function ContentEditor({
 										</div>
 										{item?.scheduledAt && (
 											<div className="mt-2 flex items-center justify-between gap-2 rounded-md border px-3 py-2">
-												<p className="text-xs text-kumo-subtle">
-													Scheduled for: {formatScheduledDate(item.scheduledAt)}
-												</p>
+												<p className="text-xs text-kumo-subtle">{t`Scheduled for: ${formatScheduledDate(item.scheduledAt)}`}</p>
 												<Button type="button" variant="outline" size="sm" onClick={onUnschedule}>
-													Unschedule
+													{t`Unschedule`}
 												</Button>
 											</div>
 										)}
@@ -695,7 +879,7 @@ export function ContentEditor({
 											{showScheduler ? (
 												<div className="space-y-2">
 													<Input
-														label="Schedule for"
+														label={t`Schedule for`}
 														type="datetime-local"
 														value={scheduleDate}
 														onChange={(e) => setScheduleDate(e.target.value)}
@@ -709,7 +893,7 @@ export function ContentEditor({
 															disabled={!scheduleDate || isScheduling}
 															icon={isScheduling ? <Loader size="sm" /> : undefined}
 														>
-															Schedule
+															{t`Schedule`}
 														</Button>
 														<Button
 															type="button"
@@ -720,7 +904,7 @@ export function ContentEditor({
 																setScheduleDate("");
 															}}
 														>
-															Cancel
+															{t`Cancel`}
 														</Button>
 													</div>
 												</div>
@@ -732,7 +916,7 @@ export function ContentEditor({
 													className="w-full"
 													onClick={() => setShowScheduler(true)}
 												>
-													Schedule for later
+													{t`Schedule for later`}
 												</Button>
 											)}
 										</div>
@@ -740,8 +924,8 @@ export function ContentEditor({
 
 									{item && (
 										<div className="text-xs text-kumo-subtle">
-											<p>Created: {new Date(item.createdAt).toLocaleString()}</p>
-											<p>Updated: {new Date(item.updatedAt).toLocaleString()}</p>
+											<p>{t`Created: ${new Date(item.createdAt).toLocaleString()}`}</p>
+											<p>{t`Updated: ${new Date(item.updatedAt).toLocaleString()}`}</p>
 										</div>
 									)}
 									{!isNew && onDelete && (
@@ -757,30 +941,29 @@ export function ContentEditor({
 															disabled={isDeleting}
 															icon={isDeleting ? <Loader size="sm" /> : <Trash />}
 														>
-															Move to Trash
+															{t`Move to Trash`}
 														</Button>
 													)}
 												/>
 												<Dialog className="p-6" size="sm">
 													<Dialog.Title className="text-lg font-semibold">
-														Move to Trash?
+														{t`Move to Trash?`}
 													</Dialog.Title>
 													<Dialog.Description className="text-kumo-subtle">
-														This will move the item to trash. You can restore it later from the
-														trash.
+														{t`This will move the item to trash. You can restore it later from the trash.`}
 													</Dialog.Description>
 													<div className="mt-6 flex justify-end gap-2">
 														<Dialog.Close
 															render={(p) => (
 																<Button {...p} variant="secondary">
-																	Cancel
+																	{t`Cancel`}
 																</Button>
 															)}
 														/>
 														<Dialog.Close
 															render={(p) => (
 																<Button {...p} variant="destructive" onClick={onDelete}>
-																	Move to Trash
+																	{t`Move to Trash`}
 																</Button>
 															)}
 														/>
@@ -795,7 +978,7 @@ export function ContentEditor({
 							{/* Ownership selector - shown only to editors and above */}
 							{currentUser && currentUser.role >= ROLE_EDITOR && users && users.length > 0 && (
 								<div className="p-4 border-t">
-									<h3 className="mb-4 font-semibold">Ownership</h3>
+									<h3 className="mb-4 font-semibold">{t`Ownership`}</h3>
 									<AuthorSelector
 										authorId={item?.authorId || null}
 										users={users}
@@ -807,13 +990,19 @@ export function ContentEditor({
 							{/* Byline credits */}
 							{currentUser && currentUser.role >= ROLE_EDITOR && (
 								<div className="p-4 border-t">
-									<h3 className="mb-4 font-semibold">Bylines</h3>
+									<h3 className="mb-4 font-semibold">{t`Bylines`}</h3>
 									<BylineCreditsEditor
 										credits={activeBylines}
 										bylines={availableBylines ?? []}
+										selectedBylineDetails={item?.bylines?.map((entry) => entry.byline)}
+										bylinesLoaded={availableBylinesLoaded}
 										onChange={handleBylinesChange}
 										onQuickCreate={onQuickCreateByline}
 										onQuickEdit={onQuickEditByline}
+										// Existing entry: use its own locale. New entry: use the
+										// URL `?locale=` (passed in via `entryLocale`).
+										entryLocale={item?.locale ?? entryLocale}
+										i18n={i18n}
 									/>
 								</div>
 							)}
@@ -821,62 +1010,31 @@ export function ContentEditor({
 							{/* Translations sidebar - shown when i18n is enabled */}
 							{i18n && item && !isNew && (
 								<div className="p-4 border-t">
-									<h3 className="mb-4 font-semibold">Translations</h3>
-									<div className="space-y-2">
-										{i18n.locales.map((locale) => {
-											const translation = translations?.find((t) => t.locale === locale);
-											const isCurrent = locale === item.locale;
-											return (
-												<div
-													key={locale}
-													className={cn(
-														"flex items-center justify-between rounded-md px-3 py-2 text-sm",
-														isCurrent
-															? "bg-kumo-brand/10 font-medium"
-															: translation
-																? "hover:bg-kumo-tint/50"
-																: "text-kumo-subtle",
-													)}
-												>
-													<div className="flex items-center gap-2">
-														<span className="text-xs font-semibold uppercase">{locale}</span>
-														{locale === i18n.defaultLocale && (
-															<span className="text-[10px] text-kumo-subtle">(default)</span>
-														)}
-														{isCurrent && (
-															<span className="text-[10px] text-kumo-brand">current</span>
-														)}
-													</div>
-													{translation && !isCurrent ? (
-														<Link
-															to="/content/$collection/$id"
-															params={{ collection, id: translation.id }}
-															className="text-xs text-kumo-brand hover:underline"
-														>
-															Edit
-														</Link>
-													) : !translation && onTranslate ? (
-														<Button
-															type="button"
-															variant="ghost"
-															size="sm"
-															className="h-auto px-2 py-1 text-xs"
-															onClick={() => onTranslate(locale)}
-														>
-															Translate
-														</Button>
-													) : null}
-												</div>
-											);
-										})}
-									</div>
+									<TranslationsPanel
+										locales={i18n.locales}
+										defaultLocale={i18n.defaultLocale}
+										currentLocale={item.locale ?? undefined}
+										translations={translations ?? []}
+										onOpen={(tr) =>
+											navigate({
+												to: "/content/$collection/$id",
+												params: { collection, id: tr.id },
+												search: { locale: tr.locale },
+											})
+										}
+										onCreate={onTranslate}
+									/>
 								</div>
 							)}
 
 							{/* Taxonomy selector */}
 							{item && (
 								<div className="p-4 border-t">
-									<TaxonomySidebar collection={collection} entryId={item.id} />
+									<TaxonomySidebar
+										collection={collection}
+										entryId={item.id}
+										entryLocale={item.locale ?? entryLocale}
+									/>
 								</div>
 							)}
 
@@ -885,9 +1043,13 @@ export function ContentEditor({
 								<div className="p-4 border-t">
 									<h3 className="mb-4 font-semibold flex items-center gap-2">
 										<MagnifyingGlass className="h-4 w-4" />
-										SEO
+										{t`SEO`}
 									</h3>
-									<SeoPanel seo={item?.seo} onChange={onSeoChange} />
+									<SeoPanel
+										contentKey={item?.id ?? `new:${collection}`}
+										seo={item?.seo}
+										onChange={handleSeoChange}
+									/>
 								</div>
 							)}
 
@@ -917,8 +1079,9 @@ interface FieldRendererProps {
 	field: FieldDescriptor;
 	value: unknown;
 	onChange: (name: string, value: unknown) => void;
-	/** Callback when a portableText editor is ready */
-	onEditorReady?: (editor: Editor) => void;
+	/** Callback when a portableText editor is ready.
+	 * Called with the editor on mount, and with `null` on unmount. */
+	onEditorReady?: (editor: Editor | null) => void;
 	/** Minimal chrome - hides toolbar, fades labels, removes borders (distraction-free mode) */
 	minimal?: boolean;
 	/** Plugin block types available for insertion in Portable Text fields */
@@ -946,6 +1109,7 @@ function FieldRenderer({
 	onBlockSidebarClose,
 	manifest,
 }: FieldRendererProps) {
+	const { t } = useLingui();
 	const pluginAdmins = usePluginAdmins();
 	const label = field.label || name.charAt(0).toUpperCase() + name.slice(1);
 	const id = `field-${name}`;
@@ -972,7 +1136,7 @@ function FieldRenderer({
 						label: string;
 						id: string;
 						required?: boolean;
-						options?: Array<{ value: string; label: string }>;
+						options?: Array<{ value: string; label: string }> | Record<string, unknown>;
 						minimal?: boolean;
 				  }>
 				| undefined;
@@ -1021,6 +1185,7 @@ function FieldRenderer({
 					value={typeof value === "string" ? value : ""}
 					onChange={(e) => handleChange(e.target.value)}
 					required={field.required}
+					dir="auto"
 					className={
 						minimal
 							? "border-0 bg-transparent px-0 text-lg font-medium focus-visible:ring-0 focus-visible:ring-offset-0"
@@ -1043,17 +1208,13 @@ function FieldRenderer({
 
 		case "boolean":
 			return (
-				<Switch
-					label={label}
-					checked={typeof value === "boolean" ? value : false}
-					onCheckedChange={handleChange}
-				/>
+				<Switch id={id} label={label} checked={Boolean(value)} onCheckedChange={handleChange} />
 			);
 
 		case "portableText": {
 			const labelId = `${id}-label`;
 			return (
-				<div>
+				<div id={id}>
 					{!minimal && (
 						<span
 							id={labelId}
@@ -1065,7 +1226,7 @@ function FieldRenderer({
 					<PortableTextEditor
 						value={Array.isArray(value) ? value : []}
 						onChange={handleChange}
-						placeholder={`Enter ${label.toLowerCase()}...`}
+						placeholder={t`Enter ${label.toLowerCase()}...`}
 						aria-labelledby={labelId}
 						pluginBlocks={pluginBlocks}
 						onEditorReady={onEditorReady}
@@ -1086,28 +1247,59 @@ function FieldRenderer({
 					value={typeof value === "string" ? value : ""}
 					onChange={(e) => handleChange(e.target.value)}
 					rows={10}
-					placeholder="Enter markdown content..."
+					dir="auto"
+					placeholder={t`Enter markdown content...`}
 				/>
 			);
 
 		case "select": {
+			const selectOptions = Array.isArray(field.options) ? field.options : [];
 			const selectItems: Record<string, string> = {};
-			for (const opt of field.options ?? []) {
+			for (const opt of selectOptions) {
 				selectItems[opt.value] = opt.label;
 			}
 			return (
 				<Select
+					id={id}
 					label={label}
 					value={typeof value === "string" ? value : ""}
 					onValueChange={(v) => handleChange(v ?? "")}
 					items={selectItems}
 				>
-					{field.options?.map((opt) => (
+					{selectOptions.map((opt) => (
 						<Select.Option key={opt.value} value={opt.value}>
 							{opt.label}
 						</Select.Option>
 					))}
 				</Select>
+			);
+		}
+
+		case "multiSelect": {
+			const multiSelectOptions = Array.isArray(field.options) ? field.options : [];
+			const selected: string[] = Array.isArray(value) ? (value as string[]) : [];
+			return (
+				<fieldset>
+					<Label className={labelClass}>{label}</Label>
+					<div className="mt-2 flex flex-wrap gap-x-4 gap-y-2">
+						{multiSelectOptions.map((opt) => {
+							const isChecked = selected.includes(opt.value);
+							return (
+								<Checkbox
+									key={opt.value}
+									label={opt.label}
+									checked={isChecked}
+									onCheckedChange={(checked) => {
+										const next = checked
+											? [...selected, opt.value]
+											: selected.filter((v) => v !== opt.value);
+										handleChange(next);
+									}}
+								/>
+							);
+						})}
+					</div>
+				</fieldset>
 			);
 		}
 
@@ -1117,8 +1309,8 @@ function FieldRenderer({
 					label={label}
 					id={id}
 					type="datetime-local"
-					value={typeof value === "string" ? value : ""}
-					onChange={(e) => handleChange(e.target.value)}
+					value={toDatetimeLocalInputValue(value)}
+					onChange={(e) => handleChange(fromDatetimeLocalInputValue(e.target.value))}
 					required={field.required}
 				/>
 			);
@@ -1129,13 +1321,99 @@ function FieldRenderer({
 				value != null && typeof value === "object" ? (value as ImageFieldValue) : undefined;
 			return (
 				<ImageFieldRenderer
+					id={id}
 					label={label}
+					description={
+						name === "featured_image"
+							? t`Used as the main visual for this post on listing pages and at the top of the post`
+							: undefined
+					}
 					value={imageValue}
+					onChange={handleChange}
+					required={field.required}
+					allowedMimeTypes={
+						Array.isArray(field.validation?.allowedMimeTypes)
+							? (field.validation.allowedMimeTypes as string[])
+							: undefined
+					}
+					fieldId={field.id}
+				/>
+			);
+		}
+
+		case "file": {
+			// value is either a FileFieldValue object or undefined.
+			// The file field type was unusable before this PR (rendered as a text input
+			// that produced raw strings nobody could meaningfully save), so there is no
+			// "legacy string" data to preserve here.
+			const fileValue =
+				value != null && typeof value === "object" ? (value as FileFieldValue) : undefined;
+			return (
+				<FileFieldRenderer
+					id={id}
+					label={label}
+					value={fileValue}
+					onChange={handleChange}
+					required={field.required}
+					allowedMimeTypes={
+						Array.isArray(field.validation?.allowedMimeTypes)
+							? (field.validation.allowedMimeTypes as string[])
+							: undefined
+					}
+					fieldId={field.id}
+				/>
+			);
+		}
+
+		case "repeater": {
+			const validation = field.validation;
+			const subFields = (validation?.subFields ?? []) as Array<{
+				slug: string;
+				type: string;
+				label: string;
+				required?: boolean;
+				options?: string[];
+			}>;
+			return (
+				<RepeaterField
+					label={label}
+					id={id}
+					value={value}
+					onChange={handleChange}
+					required={field.required}
+					subFields={subFields}
+					minItems={typeof validation?.minItems === "number" ? validation.minItems : undefined}
+					maxItems={typeof validation?.maxItems === "number" ? validation.maxItems : undefined}
+				/>
+			);
+		}
+
+		case "json": {
+			const jsonString =
+				typeof value === "string" ? value : value != null ? JSON.stringify(value, null, 2) : "";
+			return (
+				<JsonFieldEditor
+					label={label}
+					id={id}
+					value={jsonString}
 					onChange={handleChange}
 					required={field.required}
 				/>
 			);
 		}
+
+		case "url":
+			return (
+				<UrlFieldEditor
+					label={label}
+					labelClass={labelClass}
+					id={id}
+					value={typeof value === "string" ? value : ""}
+					onChange={handleChange}
+					required={field.required}
+					placeholder="https://"
+				/>
+			);
 
 		default:
 			// Default to text input
@@ -1146,84 +1424,279 @@ function FieldRenderer({
 					value={typeof value === "string" ? value : ""}
 					onChange={(e) => handleChange(e.target.value)}
 					required={field.required}
+					dir="auto"
 				/>
 			);
 	}
 }
 
+const URL_PROTOCOL_PATTERN = /^https?:\/\//;
+
+function isValidUrl(val: string): boolean {
+	if (!URL_PROTOCOL_PATTERN.test(val)) return false;
+	try {
+		const url = new URL(val);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+		if (url.hostname.includes("..")) return false;
+		return url.hostname.includes(".") || url.hostname === "localhost";
+	} catch {
+		return false;
+	}
+}
+
 /**
- * Image field value - matches emdash's MediaValue type
+ * URL field editor with validation on blur
  */
-interface ImageFieldValue {
+function UrlFieldEditor({
+	label,
+	labelClass,
+	id,
+	value,
+	onChange,
+	required,
+	placeholder,
+}: {
+	label: string;
+	labelClass?: string;
 	id: string;
-	/** Provider ID (e.g., "local", "cloudflare-images") */
+	value: string;
+	onChange: (value: unknown) => void;
+	required?: boolean;
+	placeholder?: string;
+}) {
+	const { t } = useLingui();
+	const [error, setError] = React.useState<string | null>(null);
+
+	const handleBlur = (e: React.FocusEvent<HTMLInputElement>) => {
+		const val = e.target.value.trim();
+		if (!val) {
+			setError(null);
+			return;
+		}
+		if (!isValidUrl(val)) {
+			setError(t`Enter a valid URL (e.g. https://example.com)`);
+		} else {
+			setError(null);
+		}
+	};
+
+	return (
+		<div>
+			<Input
+				label={<span className={labelClass}>{label}</span>}
+				id={id}
+				type="url"
+				value={value}
+				onChange={(e) => {
+					if (error) setError(null);
+					onChange(e.target.value);
+				}}
+				onBlur={handleBlur}
+				required={required}
+				placeholder={placeholder}
+			/>
+			{error && <p className="text-sm text-kumo-danger mt-1">{error}</p>}
+		</div>
+	);
+}
+
+/**
+ * JSON field editor with syntax validation
+ */
+function JsonFieldEditor({
+	label,
+	id,
+	value,
+	onChange,
+	required,
+}: {
+	label: string;
+	id: string;
+	value: string;
+	onChange: (value: unknown) => void;
+	required?: boolean;
+}) {
+	const { t } = useLingui();
+	const [text, setText] = React.useState(value);
+	const [error, setError] = React.useState<string | null>(null);
+
+	// Sync from parent when value changes externally
+	React.useEffect(() => {
+		setText(value);
+		setError(null);
+	}, [value]);
+
+	const handleChange = (newText: string) => {
+		setText(newText);
+		setError(null);
+	};
+
+	const handleBlur = () => {
+		const trimmed = text.trim();
+		if (trimmed === "") {
+			setError(null);
+			onChange(null);
+			return;
+		}
+		try {
+			const parsed = JSON.parse(trimmed);
+			setError(null);
+			onChange(parsed);
+		} catch {
+			setError(t`Invalid JSON`);
+		}
+	};
+
+	return (
+		<div>
+			<InputArea
+				label={label}
+				id={id}
+				value={text}
+				onChange={(e) => handleChange(e.target.value)}
+				onBlur={handleBlur}
+				rows={8}
+				placeholder="{}"
+				required={required}
+				className="font-mono text-sm"
+			/>
+			{error && <p className="text-sm text-kumo-danger mt-1">{error}</p>}
+		</div>
+	);
+}
+
+// ImageFieldRenderer (and its ImageFieldValue shape) moved to
+// ./ImageFieldRenderer so repeater sub-fields can reuse the picker.
+
+/**
+ * File field value — matches the "file" shape validated by the Zod generator:
+ * { id, provider?, src?, filename?, mimeType?, size?, meta? }
+ */
+interface FileFieldValue {
+	id: string;
+	/** Provider ID (e.g., "local", "s3") */
 	provider?: string;
-	/** Direct URL for local media or legacy data */
+	/** Direct URL for non-local media */
 	src?: string;
-	/** Preview URL for admin display (separate from src used for rendering) */
-	previewUrl?: string;
-	alt?: string;
-	width?: number;
-	height?: number;
+	filename?: string;
+	mimeType?: string;
+	size?: number;
 	/** Provider-specific metadata */
 	meta?: Record<string, unknown>;
 }
 
-/**
- * Image field with media picker
- *
- * Stores full image metadata including dimensions for responsive images.
- * Handles backwards compatibility with legacy string URLs.
- */
-interface ImageFieldRendererProps {
+interface FileFieldRendererProps {
+	id?: string;
 	label: string;
-	value: ImageFieldValue | string | undefined;
-	onChange: (value: ImageFieldValue | undefined) => void;
+	value: FileFieldValue | undefined;
+	onChange: (value: FileFieldValue | null) => void;
 	required?: boolean;
+	allowedMimeTypes?: string[];
+	fieldId?: string;
 }
 
-function ImageFieldRenderer({ label, value, onChange, required }: ImageFieldRendererProps) {
+/**
+ * File field with media picker
+ *
+ * Like ImageFieldRenderer but for arbitrary file types. Shows a mime-type-appropriate
+ * icon, filename, and size instead of an image preview.
+ */
+function FileFieldRenderer({
+	id,
+	label,
+	value,
+	onChange,
+	required,
+	allowedMimeTypes,
+	fieldId,
+}: FileFieldRendererProps) {
+	const { t } = useLingui();
 	const [pickerOpen, setPickerOpen] = React.useState(false);
-	// Normalize value to get display URL (handles both object and legacy string)
-	// Prefer previewUrl for admin display, fall back to src, then derive from storageKey/id
-	const displayUrl =
-		typeof value === "string"
-			? value
-			: value?.previewUrl ||
-				value?.src ||
-				(value && (!value.provider || value.provider === "local")
-					? `/_emdash/api/media/file/${typeof value.meta?.storageKey === "string" ? value.meta.storageKey : value.id}`
-					: undefined);
+
+	// Normalize value to derive display info.
+	// For local files, prefer meta.storageKey; fall back to value.src when it's an
+	// internal media path; finally fall back to value.id so local files remain
+	// clickable even when metadata is sparse. For external providers, use value.src
+	// but only when it's an http(s) URL — a hostile provider plugin could otherwise
+	// return a data: or javascript: URL that gets rendered as a clickable link.
+	const normalized = React.useMemo(() => {
+		if (!value) return null;
+		const isLocal = !value.provider || value.provider === "local";
+		const storageKey =
+			typeof value.meta?.storageKey === "string" ? value.meta.storageKey : undefined;
+		const localSrc =
+			typeof value.src === "string" && value.src.startsWith("/_emdash/") ? value.src : undefined;
+		// Storage keys come from server-controlled paths today, but the Zod schema
+		// now lets clients write arbitrary `meta.storageKey` strings via the content
+		// API. Encode before interpolating so attacker-shaped values can't escape
+		// the path with `?` or `#`.
+		const localUrl = isLocal
+			? storageKey
+				? `/_emdash/api/media/file/${encodeURIComponent(storageKey)}`
+				: (localSrc ?? `/_emdash/api/media/file/${encodeURIComponent(value.id)}`)
+			: undefined;
+		const externalUrl = !isLocal && value.src && isSafeUrl(value.src) ? value.src : undefined;
+		return {
+			displayUrl: localUrl ?? externalUrl,
+			filename: value.filename || t`Untitled file`,
+			mimeType: value.mimeType || "",
+			size: value.size,
+		};
+	}, [value, t]);
 
 	const handleSelect = (item: MediaItem) => {
 		const isLocalProvider = !item.provider || item.provider === "local";
-
 		onChange({
 			id: item.id,
 			provider: item.provider || "local",
-			// Local media derives URLs from meta.storageKey at display time — no src needed
-			// External providers cache a preview URL for admin display
-			previewUrl: isLocalProvider ? undefined : item.url,
-			alt: item.alt || "",
-			width: item.width,
-			height: item.height,
+			src: isLocalProvider ? undefined : item.url,
+			filename: item.filename,
+			mimeType: item.mimeType,
+			size: item.size,
 			meta: isLocalProvider ? { ...item.meta, storageKey: item.storageKey } : item.meta,
 		});
 	};
 
 	const handleRemove = () => {
-		onChange(undefined);
+		onChange(null);
 	};
 
+	const hasMime = !!normalized?.mimeType;
+	const size = typeof normalized?.size === "number" ? normalized.size : undefined;
+	const hasSize = size !== undefined;
+
 	return (
-		<div>
+		<div id={id}>
 			<Label>{label}</Label>
-			{displayUrl ? (
-				<div className="mt-2 relative group">
-					<img src={displayUrl} alt="" className="max-h-48 rounded-lg border object-cover" />
-					<div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+			{normalized ? (
+				<div className="mt-2 flex items-center gap-3 rounded-lg border p-3">
+					<span className="text-3xl" aria-hidden="true">
+						{getFileIcon(normalized.mimeType)}
+					</span>
+					<div className="flex-1 min-w-0">
+						{normalized.displayUrl ? (
+							<a
+								href={normalized.displayUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								className="text-sm font-medium truncate block hover:underline"
+							>
+								{normalized.filename}
+							</a>
+						) : (
+							<p className="text-sm font-medium truncate">{normalized.filename}</p>
+						)}
+						{(hasMime || hasSize) && (
+							<p className="text-xs text-kumo-subtle">
+								{hasMime ? normalized.mimeType : null}
+								{hasMime && hasSize ? " • " : null}
+								{hasSize ? formatFileSize(size) : null}
+							</p>
+						)}
+					</div>
+					<div className="flex gap-1">
 						<Button type="button" size="sm" variant="secondary" onClick={() => setPickerOpen(true)}>
-							Change
+							{t`Change`}
 						</Button>
 						<Button
 							type="button"
@@ -1231,7 +1704,7 @@ function ImageFieldRenderer({ label, value, onChange, required }: ImageFieldRend
 							variant="destructive"
 							className="h-8 w-8"
 							onClick={handleRemove}
-							aria-label="Remove image"
+							aria-label={t`Remove ${label}`}
 						>
 							<X className="h-4 w-4" />
 						</Button>
@@ -1243,10 +1716,11 @@ function ImageFieldRenderer({ label, value, onChange, required }: ImageFieldRend
 					variant="outline"
 					className="mt-2 w-full h-32 border-dashed"
 					onClick={() => setPickerOpen(true)}
+					aria-label={t`Select ${label}`}
 				>
 					<div className="flex flex-col items-center gap-2 text-kumo-subtle">
-						<ImageIcon className="h-8 w-8" />
-						<span>Select image</span>
+						<Paperclip className="h-8 w-8" />
+						<span>{t`Select file`}</span>
 					</div>
 				</Button>
 			)}
@@ -1254,11 +1728,14 @@ function ImageFieldRenderer({ label, value, onChange, required }: ImageFieldRend
 				open={pickerOpen}
 				onOpenChange={setPickerOpen}
 				onSelect={handleSelect}
-				mimeTypeFilter="image/"
-				title={`Select ${label}`}
+				mimeTypeFilters={allowedMimeTypes ?? []}
+				fieldId={fieldId}
+				hideUrlInput
+				mediaKind="file"
+				title={t`Select ${label}`}
 			/>
-			{required && !displayUrl && (
-				<p className="text-sm text-kumo-danger mt-1">This field is required</p>
+			{required && !normalized && (
+				<p className="text-sm text-kumo-danger mt-1">{t`This field is required`}</p>
 			)}
 		</div>
 	);
@@ -1276,22 +1753,45 @@ interface AuthorSelectorProps {
 interface BylineCreditsEditorProps {
 	credits: BylineCreditInput[];
 	bylines: BylineSummary[];
+	/**
+	 * Full byline details for the entry's already-selected credits. Seeded from
+	 * the saved entry so credited bylines always render their name/slug even when
+	 * they fall outside the initial (unsearched) picker list.
+	 */
+	selectedBylineDetails?: BylineSummary[];
 	onChange: (bylines: BylineCreditInput[]) => void;
 	onQuickCreate?: (input: { slug: string; displayName: string }) => Promise<BylineSummary>;
 	onQuickEdit?: (
 		bylineId: string,
 		input: { slug: string; displayName: string },
 	) => Promise<BylineSummary>;
+	/**
+	 * Locale of the entry being edited. When the picker comes back empty and
+	 * the install is multi-locale, the empty-state copy and CTA link are
+	 * scoped to this locale (post-migration 040, the picker is strict
+	 * per-locale — see the bylines manager flow).
+	 */
+	entryLocale?: string | null;
+	/** i18n config from the manifest. When set with >1 locales, the editor renders the locale-scoped empty-state. */
+	i18n?: { defaultLocale: string; locales: string[] } | null;
+	/** Suppresses the empty-state until the picker query resolves. Defaults to true. */
+	bylinesLoaded?: boolean;
 }
 
 function BylineCreditsEditor({
 	credits,
 	bylines,
+	selectedBylineDetails,
 	onChange,
 	onQuickCreate,
 	onQuickEdit,
+	entryLocale,
+	i18n,
+	bylinesLoaded = true,
 }: BylineCreditsEditorProps) {
-	const [selectedBylineId, setSelectedBylineId] = React.useState("");
+	const { t } = useLingui();
+	const [search, setSearch] = React.useState("");
+	const debouncedSearch = useDebouncedValue(search, 300);
 	const [quickName, setQuickName] = React.useState("");
 	const [quickSlug, setQuickSlug] = React.useState("");
 	const [quickError, setQuickError] = React.useState<string | null>(null);
@@ -1302,9 +1802,39 @@ function BylineCreditsEditor({
 	const [editError, setEditError] = React.useState<string | null>(null);
 	const [isEditing, setIsEditing] = React.useState(false);
 
-	const bylineMap = React.useMemo(() => new Map(bylines.map((b) => [b.id, b])), [bylines]);
+	// Server-side search so the picker isn't limited to the first page of
+	// bylines (previously capped at 100 with no way to find the rest). When the
+	// search box is empty we fall back to the parent-provided initial list.
+	const trimmedSearch = debouncedSearch.trim();
+	const searchEnabled = trimmedSearch.length > 0;
+	const searchResults = useQuery({
+		queryKey: ["bylines", "credit-picker", entryLocale ?? null, trimmedSearch],
+		queryFn: () =>
+			fetchBylines({ search: trimmedSearch, locale: entryLocale ?? undefined, limit: 20 }),
+		enabled: searchEnabled,
+		placeholderData: keepPreviousData,
+	});
 
-	const availableToAdd = bylines.filter((b) => !credits.some((c) => c.bylineId === b.id));
+	const resultPool = searchEnabled ? (searchResults.data?.items ?? []) : bylines;
+	const hasMoreResults = searchEnabled ? !!searchResults.data?.nextCursor : bylines.length >= 100;
+
+	// Resolve credited bylines to their full details for display. Selected rows
+	// come from the parent-provided details so they keep rendering even when the
+	// current search results no longer include them.
+	const bylineMap = React.useMemo(() => {
+		const map = new Map<string, BylineSummary>();
+		for (const b of selectedBylineDetails ?? []) map.set(b.id, b);
+		for (const b of bylines) map.set(b.id, b);
+		for (const b of searchResults.data?.items ?? []) map.set(b.id, b);
+		return map;
+	}, [selectedBylineDetails, bylines, searchResults.data?.items]);
+
+	const availableToAdd = resultPool.filter((b) => !credits.some((c) => c.bylineId === b.id));
+
+	const addByline = (bylineId: string) => {
+		if (credits.some((c) => c.bylineId === bylineId)) return;
+		onChange([...credits, { bylineId, roleLabel: null }]);
+	};
 
 	const move = (index: number, direction: -1 | 1) => {
 		const target = index + direction;
@@ -1336,33 +1866,65 @@ function BylineCreditsEditor({
 		setEditError(null);
 	};
 
+	// Multi-locale install with no bylines at the entry's locale: show a
+	// CTA to the byline manager, scoped to that locale. Quick-create
+	// still works inline.
+	const isMultiLocale = !!i18n && i18n.locales.length > 1;
+	const showLocaleEmptyState =
+		isMultiLocale && bylinesLoaded && bylines.length === 0 && !!entryLocale;
+
 	return (
 		<div className="space-y-3">
-			<div className="flex gap-2">
-				<select
-					value={selectedBylineId}
-					onChange={(e) => setSelectedBylineId(e.target.value)}
-					className="w-full rounded border bg-kumo-base px-3 py-2 text-sm"
-				>
-					<option value="">Select byline...</option>
-					{availableToAdd.map((b) => (
-						<option key={b.id} value={b.id}>
-							{b.displayName}
-						</option>
-					))}
-				</select>
-				<Button
-					type="button"
-					variant="secondary"
-					onClick={() => {
-						if (!selectedBylineId) return;
-						onChange([...credits, { bylineId: selectedBylineId, roleLabel: null }]);
-						setSelectedBylineId("");
-					}}
-					disabled={!selectedBylineId}
-				>
-					Add
-				</Button>
+			{showLocaleEmptyState && (
+				<div className="rounded border border-dashed p-3 text-sm space-y-2">
+					<p className="text-kumo-subtle">
+						{t`No bylines available in ${entryLocale}. Create a variant from the Bylines page before crediting one on this entry.`}
+					</p>
+					<RouterLinkButton
+						to="/bylines"
+						search={{ locale: entryLocale ?? undefined }}
+						variant="secondary"
+						size="sm"
+					>
+						{t`Manage bylines in ${entryLocale}`}
+					</RouterLinkButton>
+				</div>
+			)}
+			<div className="space-y-2">
+				<Input
+					value={search}
+					onChange={(e) => setSearch(e.target.value)}
+					placeholder={t`Search bylines to add...`}
+					aria-label={t`Search bylines`}
+				/>
+				{searchEnabled && searchResults.isLoading ? (
+					<p className="text-sm text-kumo-subtle">{t`Searching...`}</p>
+				) : availableToAdd.length > 0 ? (
+					<ul className="max-h-48 divide-y overflow-y-auto rounded border">
+						{availableToAdd.map((b) => (
+							<li key={b.id}>
+								<button
+									type="button"
+									className="flex w-full items-center justify-between gap-2 p-2 text-start hover:bg-kumo-tint"
+									onClick={() => addByline(b.id)}
+								>
+									<span className="min-w-0">
+										<span className="block truncate text-sm font-medium">{b.displayName}</span>
+										<span className="block truncate text-xs text-kumo-subtle">{b.slug}</span>
+									</span>
+									<span className="text-xs text-kumo-subtle">{t`Add`}</span>
+								</button>
+							</li>
+						))}
+					</ul>
+				) : searchEnabled && searchResults.isError ? (
+					<p className="text-sm text-kumo-danger">{t`Couldn't search bylines. Please try again.`}</p>
+				) : searchEnabled ? (
+					<p className="text-sm text-kumo-subtle">{t`No matching bylines.`}</p>
+				) : null}
+				{hasMoreResults && (
+					<p className="text-xs text-kumo-subtle">{t`Keep typing to narrow down more bylines.`}</p>
+				)}
 			</div>
 
 			{credits.length > 0 ? (
@@ -1379,10 +1941,10 @@ function BylineCreditsEditor({
 									</div>
 									<div className="flex gap-1">
 										<Button type="button" variant="ghost" size="sm" onClick={() => move(index, -1)}>
-											Up
+											{t`Up`}
 										</Button>
 										<Button type="button" variant="ghost" size="sm" onClick={() => move(index, 1)}>
-											Down
+											{t`Down`}
 										</Button>
 										{onQuickEdit && (
 											<Button
@@ -1391,7 +1953,7 @@ function BylineCreditsEditor({
 												size="sm"
 												onClick={() => openEditByline(byline)}
 											>
-												Edit
+												{t`Edit`}
 											</Button>
 										)}
 										<Button
@@ -1400,12 +1962,12 @@ function BylineCreditsEditor({
 											size="sm"
 											onClick={() => onChange(credits.filter((_, i) => i !== index))}
 										>
-											Remove
+											{t`Remove`}
 										</Button>
 									</div>
 								</div>
 								<Input
-									label="Role label"
+									label={t`Role label`}
 									value={credit.roleLabel ?? ""}
 									onChange={(e) => {
 										const next = [...credits];
@@ -1423,7 +1985,7 @@ function BylineCreditsEditor({
 					})}
 				</div>
 			) : (
-				<p className="text-sm text-kumo-subtle">No bylines selected.</p>
+				<p className="text-sm text-kumo-subtle">{t`No bylines selected.`}</p>
 			)}
 
 			{onQuickCreate && (
@@ -1431,15 +1993,15 @@ function BylineCreditsEditor({
 					<Dialog.Trigger
 						render={(p) => (
 							<Button {...p} type="button" variant="secondary">
-								Quick create byline
+								{t`Quick create byline`}
 							</Button>
 						)}
 					/>
 					<Dialog className="p-6" size="sm">
-						<Dialog.Title className="text-lg font-semibold">Create byline</Dialog.Title>
+						<Dialog.Title className="text-lg font-semibold">{t`Create byline`}</Dialog.Title>
 						<div className="mt-4 space-y-3">
 							<Input
-								label="Display name"
+								label={t`Display name`}
 								value={quickName}
 								onChange={(e) => {
 									setQuickName(e.target.value);
@@ -1447,7 +2009,7 @@ function BylineCreditsEditor({
 								}}
 							/>
 							<Input
-								label="Slug"
+								label={t`Slug`}
 								value={quickSlug}
 								onChange={(e) => setQuickSlug(e.target.value)}
 							/>
@@ -1456,8 +2018,15 @@ function BylineCreditsEditor({
 						<div className="mt-6 flex justify-end gap-2">
 							<Dialog.Close
 								render={(p) => (
-									<Button {...p} variant="secondary" onClick={resetQuickCreate}>
-										Cancel
+									<Button
+										{...p}
+										variant="secondary"
+										onClick={(e) => {
+											resetQuickCreate();
+											p.onClick?.(e);
+										}}
+									>
+										{t`Cancel`}
 									</Button>
 								)}
 							/>
@@ -1475,13 +2044,13 @@ function BylineCreditsEditor({
 										onChange([...credits, { bylineId: created.id, roleLabel: null }]);
 										resetQuickCreate();
 									} catch (err) {
-										setQuickError(err instanceof Error ? err.message : "Failed to create byline");
+										setQuickError(err instanceof Error ? err.message : t`Failed to create byline`);
 									} finally {
 										setIsCreating(false);
 									}
 								}}
 							>
-								{isCreating ? "Creating..." : "Create"}
+								{isCreating ? t`Creating...` : t`Create`}
 							</Button>
 						</div>
 					</Dialog>
@@ -1491,22 +2060,26 @@ function BylineCreditsEditor({
 			{onQuickEdit && editBylineId && (
 				<Dialog.Root open onOpenChange={(open) => (!open ? resetQuickEdit() : undefined)}>
 					<Dialog className="p-6" size="sm">
-						<Dialog.Title className="text-lg font-semibold">Edit byline</Dialog.Title>
+						<Dialog.Title className="text-lg font-semibold">{t`Edit byline`}</Dialog.Title>
 						<div className="mt-4 space-y-3">
 							<Input
-								label="Display name"
+								label={t`Display name`}
 								value={editName}
 								onChange={(e) => {
 									setEditName(e.target.value);
 									if (!editSlug) setEditSlug(slugify(e.target.value));
 								}}
 							/>
-							<Input label="Slug" value={editSlug} onChange={(e) => setEditSlug(e.target.value)} />
+							<Input
+								label={t`Slug`}
+								value={editSlug}
+								onChange={(e) => setEditSlug(e.target.value)}
+							/>
 							{editError && <p className="text-sm text-kumo-danger">{editError}</p>}
 						</div>
 						<div className="mt-6 flex justify-end gap-2">
 							<Button type="button" variant="secondary" onClick={resetQuickEdit}>
-								Cancel
+								{t`Cancel`}
 							</Button>
 							<Button
 								type="button"
@@ -1521,13 +2094,13 @@ function BylineCreditsEditor({
 										});
 										resetQuickEdit();
 									} catch (err) {
-										setEditError(err instanceof Error ? err.message : "Failed to update byline");
+										setEditError(err instanceof Error ? err.message : t`Failed to update byline`);
 									} finally {
 										setIsEditing(false);
 									}
 								}}
 							>
-								{isEditing ? "Saving..." : "Save"}
+								{isEditing ? t`Saving...` : t`Save`}
 							</Button>
 						</div>
 					</Dialog>
@@ -1538,9 +2111,10 @@ function BylineCreditsEditor({
 }
 
 function AuthorSelector({ authorId, users, onChange }: AuthorSelectorProps) {
+	const { t } = useLingui();
 	const currentAuthor = users.find((u) => u.id === authorId);
 
-	const authorItems: Record<string, string> = { unassigned: "Unassigned" };
+	const authorItems: Record<string, string> = { unassigned: t`Unassigned` };
 	for (const user of users) {
 		authorItems[user.id] = user.name || user.email;
 	}
@@ -1555,7 +2129,7 @@ function AuthorSelector({ authorId, users, onChange }: AuthorSelectorProps) {
 				items={authorItems}
 			>
 				<Select.Option value="unassigned">
-					<span className="text-kumo-subtle">Unassigned</span>
+					<span className="text-kumo-subtle">{t`Unassigned`}</span>
 				</Select.Option>
 				{users.map((user) => (
 					<Select.Option key={user.id} value={user.id}>

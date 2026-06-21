@@ -18,6 +18,25 @@
 const STORAGE_PREFIX = "ec-form:";
 const DEBOUNCE_MS = 500;
 
+type SubmitResponse = {
+	success?: boolean;
+	message?: string;
+	redirect?: string;
+	errors?: Array<{ field: string; message: string }>;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseSubmitResponse(body: unknown): SubmitResponse {
+	if (isRecord(body) && isRecord(body.data)) {
+		return body.data as SubmitResponse;
+	}
+
+	return isRecord(body) ? (body as SubmitResponse) : {};
+}
+
 let saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let listenersRegistered = false;
 
@@ -127,17 +146,18 @@ async function handleSubmit(e: Event) {
 			body,
 		});
 
-		const result = (await res.json()) as {
-			success?: boolean;
-			message?: string;
-			redirect?: string;
-			errors?: Array<{ field: string; message: string }>;
-		};
+		const result = parseSubmitResponse(await res.json());
 
 		if (result.success) {
 			clearSavedState(form);
 			if (result.redirect) {
-				window.location.href = result.redirect;
+				// prevent xss
+				if (isSafeRedirectUrl(result.redirect)) {
+					window.location.href = result.redirect;
+				} else {
+					showStatus(form, result.message || "Submitted successfully.", "success");
+					form.reset();
+				}
 			} else {
 				showStatus(form, result.message || "Submitted successfully.", "success");
 				form.reset();
@@ -154,6 +174,16 @@ async function handleSubmit(e: Event) {
 			submitBtn.disabled = false;
 			submitBtn.textContent = form.dataset.submitLabel || "Submit";
 		}
+	}
+}
+
+/** validates that a redirect url uses a safe protocol */
+function isSafeRedirectUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url, window.location.href);
+		return ["http:", "https:", "mailto:", "tel:"].includes(parsed.protocol);
+	} catch {
+		return false;
 	}
 }
 

@@ -34,8 +34,9 @@ export type RescheduleFn = () => void;
 /**
  * Executes overdue cron tasks.
  *
- * Called by platform-specific schedulers (NodeCronScheduler, EmDashScheduler DO,
- * PiggybackScheduler). Stateless — all state lives in the database.
+ * Called by the platform driver: the NodeCronScheduler timer on Node, or the
+ * Worker's `scheduled()` handler (via runScheduledTasks) on Cloudflare.
+ * Stateless — all state lives in the database.
  */
 export class CronExecutor {
 	constructor(
@@ -113,13 +114,38 @@ export class CronExecutor {
 
 			if (task.is_oneshot) {
 				if (hookFailed) {
-					// Keep the task for retry — reset to idle with a 1-minute backoff
-					const retryAt = new Date(Date.now() + 60_000).toISOString();
-					await sql`
+					// Retry metadata is namespaced under __emdash to avoid collisions
+					// with plugin-controlled data fields.
+					const meta =
+						parsedData?.__emdash != null && typeof parsedData.__emdash === "object"
+							? (parsedData.__emdash as Record<string, unknown>)
+							: undefined;
+					const raw = meta?.retryCount;
+					const retryCount =
+						typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+					const MAX_ONESHOT_RETRIES = 5;
+
+					if (retryCount >= MAX_ONESHOT_RETRIES) {
+						console.error(
+							`[cron] One-shot task ${task.plugin_id}:${task.task_name} exceeded ${MAX_ONESHOT_RETRIES} retries, removing`,
+						);
+						await sql`
+						DELETE FROM _emdash_cron_tasks WHERE id = ${task.id}
+					`.execute(this.db);
+					} else {
+						// Retry with exponential backoff: 1m, 2m, 4m, 8m, 16m
+						const backoffMs = 60_000 * Math.pow(2, retryCount);
+						const retryAt = new Date(Date.now() + backoffMs).toISOString();
+						const updatedData = JSON.stringify({
+							...parsedData,
+							__emdash: { ...meta, retryCount: retryCount + 1 },
+						});
+						await sql`
 						UPDATE _emdash_cron_tasks
-						SET status = 'idle', locked_at = NULL, next_run_at = ${retryAt}
+						SET status = 'idle', locked_at = NULL, next_run_at = ${retryAt}, data = ${updatedData}
 						WHERE id = ${task.id}
 					`.execute(this.db);
+					}
 				} else {
 					// Success: delete the one-shot task
 					await sql`

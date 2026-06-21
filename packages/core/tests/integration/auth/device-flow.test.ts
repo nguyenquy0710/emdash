@@ -229,6 +229,36 @@ describe("Device Token Exchange: Error Cases", () => {
 		expect(result.error.code).toBe("INVALID_GRANT");
 	});
 
+	it("should reject a second exchange for an already-consumed device code", async () => {
+		const codeResult = await handleDeviceCodeRequest(
+			db,
+			{ client_id: "emdash-cli" },
+			"https://example.com/_emdash/device",
+		);
+		expect(codeResult.success).toBe(true);
+		if (!codeResult.success) return;
+
+		await handleDeviceAuthorize(db, "user-1", Role.ADMIN, {
+			user_code: codeResult.data.user_code,
+		});
+
+		// First exchange succeeds
+		const first = await handleDeviceTokenExchange(db, {
+			device_code: codeResult.data.device_code,
+			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+		});
+		expect(first.success).toBe(true);
+
+		// Second exchange fails — device code was consumed atomically
+		const second = await handleDeviceTokenExchange(db, {
+			device_code: codeResult.data.device_code,
+			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+		});
+		expect(second.success).toBe(false);
+		if (second.success) return;
+		expect(second.error.code).toBe("INVALID_GRANT");
+	});
+
 	it("should report expired device codes", async () => {
 		// Create a device code that's already expired
 		await db
@@ -319,6 +349,7 @@ describe("Token Revoke", () => {
 	it("should revoke an access token", async () => {
 		// Get tokens via device flow
 		const codeResult = await handleDeviceCodeRequest(db, {}, "https://example.com/_emdash/device");
+		expect(codeResult.success).toBe(true);
 		if (!codeResult.success) return;
 
 		await handleDeviceAuthorize(db, "user-1", Role.ADMIN, {
@@ -329,6 +360,7 @@ describe("Token Revoke", () => {
 			device_code: codeResult.data.device_code,
 			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 		});
+		expect(tokenResult.success).toBe(true);
 		if (!tokenResult.success) return;
 
 		// Revoke the access token
@@ -350,6 +382,7 @@ describe("Token Revoke", () => {
 	it("should revoke a refresh token and its access tokens", async () => {
 		// Get tokens via device flow
 		const codeResult = await handleDeviceCodeRequest(db, {}, "https://example.com/_emdash/device");
+		expect(codeResult.success).toBe(true);
 		if (!codeResult.success) return;
 
 		await handleDeviceAuthorize(db, "user-1", Role.ADMIN, {
@@ -360,6 +393,7 @@ describe("Token Revoke", () => {
 			device_code: codeResult.data.device_code,
 			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 		});
+		expect(tokenResult.success).toBe(true);
 		if (!tokenResult.success) return;
 
 		// Revoke the refresh token

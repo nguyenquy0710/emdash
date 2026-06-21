@@ -2,9 +2,9 @@ import { Sidebar } from "@cloudflare/kumo";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import * as React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render } from "vitest-browser-react";
 
 import { ThemeProvider } from "../../src/components/ThemeProvider";
+import { render } from "../utils/render.tsx";
 
 // Mock router
 vi.mock("@tanstack/react-router", async () => {
@@ -53,7 +53,7 @@ const { Header } = await import("../../src/components/Header");
 // Constants
 // ---------------------------------------------------------------------------
 
-const THEME_BUTTON_REGEX = /Theme:/;
+const THEME_BUTTON_REGEX = /Toggle theme/;
 
 function TestWrapper({ children }: { children: React.ReactNode }) {
 	const qc = new QueryClient({
@@ -80,8 +80,9 @@ describe("Header", () => {
 				<Header />
 			</TestWrapper>,
 		);
-		// ThemeToggle renders a button with title containing "Theme:"
-		const themeButton = screen.getByTitle(THEME_BUTTON_REGEX);
+		// ThemeToggle renders a button with aria-label "Toggle theme (current: …)"
+		// (Kumo 2.x wraps `<Button title>` as a Tooltip popup, not a DOM title.)
+		const themeButton = screen.getByLabelText(THEME_BUTTON_REGEX);
 		await expect.element(themeButton).toBeInTheDocument();
 	});
 

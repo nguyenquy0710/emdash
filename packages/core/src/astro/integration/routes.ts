@@ -4,9 +4,14 @@
  * Defines and injects all EmDash routes into the Astro application.
  */
 
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { routeArtifactName } from "./route-naming.js";
+
+const TS_EXT = /\.tsx?$/;
 
 /**
  * Resolve path to a route file in the package
@@ -18,22 +23,61 @@ function resolveRoute(route: string): string {
 	const require = createRequire(import.meta.url);
 	const __dirname = dirname(fileURLToPath(import.meta.url));
 
+	// .astro routes ship as source (the consumer's Astro build processes them);
+	// .ts/.tsx routes are compiled, exported extensionless via emdash/routes/*.
+	const isAstro = route.endsWith(".astro");
+	const specifier = isAstro ? route : routeArtifactName(route.replace(TS_EXT, ""));
+
 	try {
 		// Try to resolve as package export
-		return require.resolve(`emdash/routes/${route}`);
+		return require.resolve(`emdash/routes/${specifier}`);
 	} catch {
-		// Fallback to relative path (for development)
-		return resolve(__dirname, "../routes", route);
+		// Fallback for development (e.g. dist not yet built).
+		return isAstro
+			? resolve(__dirname, "../routes", route)
+			: resolve(__dirname, "../routes", `${specifier}.mjs`);
 	}
 }
 
 /** Route injection function type */
 type InjectRoute = (route: { pattern: string; entrypoint: string }) => void;
 
+interface InjectCoreRoutesOptions {
+	srcDir?: URL;
+}
+
+const ROUTE_OVERRIDE_EXTENSIONS = [
+	".astro",
+	".js",
+	".ts",
+	".jsx",
+	".tsx",
+	".mjs",
+	".mts",
+	".md",
+	".mdx",
+	".html",
+];
+
+/**
+ * Detect whether the host site defines its own root-level public route file.
+ */
+export function hasUserDefinedPublicRoute(srcDir: URL, basename: string): boolean {
+	const srcDirPath = fileURLToPath(srcDir);
+	return ROUTE_OVERRIDE_EXTENSIONS.some(
+		(extension) =>
+			existsSync(resolve(srcDirPath, "pages", `${basename}${extension}`)) ||
+			existsSync(resolve(srcDirPath, "pages", basename, `index${extension}`)),
+	);
+}
+
 /**
  * Injects all core EmDash routes.
  */
-export function injectCoreRoutes(injectRoute: InjectRoute): void {
+export function injectCoreRoutes(
+	injectRoute: InjectRoute,
+	options: InjectCoreRoutesOptions = {},
+): void {
 	// Inject admin shell route
 	injectRoute({
 		pattern: "/_emdash/admin/[...path]",
@@ -44,6 +88,12 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	injectRoute({
 		pattern: "/_emdash/api/manifest",
 		entrypoint: resolveRoute("api/manifest.ts"),
+	});
+
+	// Auth mode endpoint (public — used by the login page to pick the right UI)
+	injectRoute({
+		pattern: "/_emdash/api/auth/mode",
+		entrypoint: resolveRoute("api/auth/mode.ts"),
 	});
 
 	injectRoute({
@@ -69,6 +119,12 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	injectRoute({
 		pattern: "/_emdash/api/content/[collection]/[id]/preview-url",
 		entrypoint: resolveRoute("api/content/[collection]/[id]/preview-url.ts"),
+	});
+
+	// Content authors (for the admin author filter)
+	injectRoute({
+		pattern: "/_emdash/api/content/[collection]/authors",
+		entrypoint: resolveRoute("api/content/[collection]/authors.ts"),
 	});
 
 	// Trash/restore routes
@@ -148,8 +204,8 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	});
 
 	injectRoute({
-		pattern: "/_emdash/api/media/file/[key]",
-		entrypoint: resolveRoute("api/media/file/[key].ts"),
+		pattern: "/_emdash/api/media/file/[...key]",
+		entrypoint: resolveRoute("api/media/file/[...key].ts"),
 	});
 
 	injectRoute({
@@ -279,6 +335,12 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 		entrypoint: resolveRoute("api/settings.ts"),
 	});
 
+	// Email settings route
+	injectRoute({
+		pattern: "/_emdash/api/settings/email",
+		entrypoint: resolveRoute("api/settings/email.ts"),
+	});
+
 	// Snapshot route (for DO preview database population)
 	injectRoute({
 		pattern: "/_emdash/api/snapshot",
@@ -299,6 +361,11 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	injectRoute({
 		pattern: "/_emdash/api/taxonomies/[name]/terms/[slug]",
 		entrypoint: resolveRoute("api/taxonomies/[name]/terms/[slug].ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/taxonomies/[name]/terms/[slug]/translations",
+		entrypoint: resolveRoute("api/taxonomies/[name]/terms/[slug]/translations.ts"),
 	});
 
 	injectRoute({
@@ -346,6 +413,17 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	injectRoute({
 		pattern: "/_emdash/api/admin/plugins/marketplace/[id]/install",
 		entrypoint: resolveRoute("api/admin/plugins/marketplace/[id]/install.ts"),
+	});
+
+	// Experimental registry routes (see RFC 0001)
+	injectRoute({
+		pattern: "/_emdash/api/admin/plugins/registry/install",
+		entrypoint: resolveRoute("api/admin/plugins/registry/install.ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/admin/plugins/registry/artifact",
+		entrypoint: resolveRoute("api/admin/plugins/registry/artifact.ts"),
 	});
 
 	injectRoute({
@@ -411,6 +489,38 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	injectRoute({
 		pattern: "/_emdash/api/admin/bylines/[id]",
 		entrypoint: resolveRoute("api/admin/bylines/[id]/index.ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/admin/bylines/[id]/translations",
+		entrypoint: resolveRoute("api/admin/bylines/[id]/translations.ts"),
+	});
+
+	// Byline custom-field schema routes (Discussion #1174, Phase 4).
+	// Order matters: the static `reorder` route must precede the dynamic
+	// `[slug]` route so Astro's resolver dispatches POST /byline-fields/reorder
+	// to the reorder handler instead of treating "reorder" as a slug. The
+	// `reorder` slug is also reserved at the data layer
+	// (RESERVED_BYLINE_FIELD_SLUGS) so the registry rejects field creation
+	// with that name — defence in depth.
+	injectRoute({
+		pattern: "/_emdash/api/admin/byline-fields",
+		entrypoint: resolveRoute("api/admin/byline-fields/index.ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/admin/byline-fields/reorder",
+		entrypoint: resolveRoute("api/admin/byline-fields/reorder.ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/admin/byline-fields/[slug]",
+		entrypoint: resolveRoute("api/admin/byline-fields/[slug].ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/admin/byline-fields/[slug]/usage",
+		entrypoint: resolveRoute("api/admin/byline-fields/[slug]/usage.ts"),
 	});
 
 	injectRoute({
@@ -505,8 +615,14 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	});
 
 	injectRoute({
-		pattern: "/_emdash/.well-known/oauth-authorization-server",
+		pattern: "/.well-known/oauth-authorization-server/_emdash",
 		entrypoint: resolveRoute("api/well-known/oauth-authorization-server.ts"),
+	});
+
+	// RFC 7591 Dynamic Client Registration
+	injectRoute({
+		pattern: "/_emdash/api/oauth/register",
+		entrypoint: resolveRoute("api/oauth/register.ts"),
 	});
 
 	// Plugin-defined API routes
@@ -533,8 +649,18 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	});
 
 	injectRoute({
+		pattern: "/_emdash/api/menus/[name]/items/[id]",
+		entrypoint: resolveRoute("api/menus/[name]/items/[id].ts"),
+	});
+
+	injectRoute({
 		pattern: "/_emdash/api/menus/[name]/reorder",
 		entrypoint: resolveRoute("api/menus/[name]/reorder.ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/menus/[name]/translations",
+		entrypoint: resolveRoute("api/menus/[name]/translations.ts"),
 	});
 
 	// Widget area routes
@@ -659,15 +785,24 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 	});
 
 	// SEO routes (public, at site root)
-	injectRoute({
-		pattern: "/sitemap.xml",
-		entrypoint: resolveRoute("sitemap.xml.ts"),
-	});
+	if (!options.srcDir || !hasUserDefinedPublicRoute(options.srcDir, "sitemap.xml")) {
+		injectRoute({
+			pattern: "/sitemap.xml",
+			entrypoint: resolveRoute("sitemap.xml.ts"),
+		});
+	}
 
 	injectRoute({
-		pattern: "/robots.txt",
-		entrypoint: resolveRoute("robots.txt.ts"),
+		pattern: "/sitemap-[collection].xml",
+		entrypoint: resolveRoute("sitemap-[collection].xml.ts"),
 	});
+
+	if (!options.srcDir || !hasUserDefinedPublicRoute(options.srcDir, "robots.txt")) {
+		injectRoute({
+			pattern: "/robots.txt",
+			entrypoint: resolveRoute("robots.txt.ts"),
+		});
+	}
 
 	// Setup wizard API routes
 	injectRoute({
@@ -701,6 +836,11 @@ export function injectCoreRoutes(injectRoute: InjectRoute): void {
 		entrypoint: resolveRoute("api/setup/dev-reset.ts"),
 	});
 
+	injectRoute({
+		pattern: "/_emdash/api/dev/emails",
+		entrypoint: resolveRoute("api/dev/emails.ts"),
+	});
+
 	// Current user endpoint (always available)
 	injectRoute({
 		pattern: "/_emdash/api/auth/me",
@@ -723,6 +863,28 @@ export function injectMcpRoute(injectRoute: InjectRoute): void {
 		pattern: "/_emdash/api/mcp",
 		entrypoint: resolveRoute("api/mcp.ts"),
 	});
+}
+
+/**
+ * Injects routes from pluggable auth providers.
+ *
+ * Each provider declares the routes it needs in its `AuthProviderDescriptor.routes` array.
+ * Routes are injected at build time so Vite can bundle them.
+ */
+export function injectAuthProviderRoutes(
+	injectRoute: InjectRoute,
+	providers: Array<{ routes?: Array<{ pattern: string; entrypoint: string }> }>,
+): void {
+	for (const provider of providers) {
+		if (provider.routes) {
+			for (const route of provider.routes) {
+				injectRoute({
+					pattern: route.pattern,
+					entrypoint: route.entrypoint,
+				});
+			}
+		}
+	}
 }
 
 /**
@@ -781,6 +943,11 @@ export function injectBuiltinAuthRoutes(injectRoute: InjectRoute): void {
 	injectRoute({
 		pattern: "/_emdash/api/auth/invite/complete",
 		entrypoint: resolveRoute("api/auth/invite/complete.ts"),
+	});
+
+	injectRoute({
+		pattern: "/_emdash/api/auth/invite/register-options",
+		entrypoint: resolveRoute("api/auth/invite/register-options.ts"),
 	});
 
 	// Magic link routes
