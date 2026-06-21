@@ -1,0 +1,29 @@
+# docker-compose.yml
+version: "3.9"
+
+services:
+  emdash:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4321:4321"
+    volumes:
+      - ./data:/app/data
+      - ./public:/app/public
+    environment:
+      - NODE_ENV=development
+    depends_on:
+      - db
+
+  # db:
+  #   image: postgres:15
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data/
+  #   environment:
+  #     - POSTGRES_DB=emdash
+  #     - POSTGRES_USER=emdash_user
+  #     - POSTGRES_PASSWORD=emdash_password
+
+# volumes:
+#   postgres_data:
