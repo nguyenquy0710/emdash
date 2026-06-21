@@ -1,229 +1,191 @@
-This file provides guidance to agentic coding tools working in this repository.
+This file provides guidance to agentic coding tools working in this repository. Focuses on patterns and gotchas an agent needs to write correct code.
 
-For human-facing contributor info (setup, repo layout, PR policy, changesets, i18n), see [CONTRIBUTING.md](CONTRIBUTING.md). This file focuses on the patterns and gotchas an agent needs to write correct code.
+For human-facing contributor info (setup, PR policy, changesets, i18n), see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-`CLAUDE.md` is a symlink to this file. `.opencode/skills` and `.claude/skills` are symlinks to `skills/`. Don't try to sync between them.
+`CLAUDE.md` is a symlink to this file. `.opencode/skills` and `.claude/skills` are symlinks to `skills/`. Don't sync between them.
+
+Skills available for loading via `skill`: `building-emdash-site`, `creating-plugins`, `emdash-cli`, `wordpress-plugin-to-emdash`, `wordpress-theme-to-emdash`.
+
+Doc MCP server: `https://docs.emdashcms.com/mcp`.
 
 # Rules
 
-**Backwards compatibility matters.** EmDash is published and in active use, pre-1.0. Prefer additive changes (new fields, new routes, new options with defaults). Breaking changes need an explicit decision, a package bump, and a changeset that calls the break out clearly. Database migrations are forward-only -- never write one that leaves existing content inaccessible. When in doubt, open a Discussion.
+**Backwards compatibility matters.** Published pre-1.0. Prefer additive changes. Breaking changes need a decision, bump, and clear changeset. DB migrations are forward-only.
 
-**TDD for bugs.** Failing test -> fix -> verify. A bug without a reproducing test is not fixed.
+**TDD for bugs.** Failing test → fix → verify. A bug without a reproducing test is not fixed.
 
-**Localize everything user-facing.** All admin UI strings, aria labels, and toast messages go through Lingui. All admin layout uses RTL-safe logical Tailwind classes. See [Localization](#admin-ui-localization-lingui) and [RTL](#admin-ui-rtl-safe-tailwind).
+**Localize everything user-facing.** Admin UI strings, aria labels, toasts → Lingui. RTL-safe logical Tailwind classes.
 
-**Scope discipline.** No drive-by refactors, no bulk lint/type cleanups, no "while I'm here" edits in unrelated files. If you see a systemic issue, open a Discussion. See [CONTRIBUTING.md § Contribution Policy](CONTRIBUTING.md#contribution-policy).
+**Scope discipline.** No drive-by refactors, no "while I'm here" edits. Systemic issue → open a Discussion.
+
+**Updates must be typed.** When changing a `_emdash_fields` `.settings` column, update the union type in the codebase that matches it.
 
 ## Workflow
 
-Run `pnpm lint:json | jq '.diagnostics | length'` before starting and confirm it's clean -- if it's failing after your edits, your changes caused it.
+```bash
+pnpm lint:json | jq '.diagnostics | length'   # confirm clean before starting
+pnpm lint:quick   # after every edit (sub-second)
+pnpm typecheck    # packages, or pnpm typecheck:demos for demos, pnpm typecheck:templates for templates
+pnpm format       # regular (oxfmt for code, prettier for .astro)
+```
 
-During work:
+Before PR: tests pass, lint clean, formatted, changeset added if published package changed.
 
-- `pnpm lint:quick` after every edit (sub-second)
-- `pnpm typecheck` (packages) or `pnpm typecheck:demos` (Astro demos) after each round of edits
-- `pnpm format` regularly (oxfmt, tabs)
+Changeset = release notes for users, **not** a commit message or diff summary. Lead with present-tense verb (`Fixes`, `Adds`, `Updates`, `Removes`), describe observable effect, one sentence often enough.
 
-Before opening a PR: tests pass, lint clean, formatted, changeset added if a published package changed. See [CONTRIBUTING.md § Changesets](CONTRIBUTING.md#changesets).
+When opening a PR via `gh`/API: copy `.github/PULL_REQUEST_TEMPLATE.md` into body and fill every section — the UI injects it automatically but the CLI does not, and PRs missing it are auto-closed. Check AI-generated code disclosure, name the model.
 
-A changeset is release notes a user reads while upgrading -- **not** a commit message, PR description, or summary of your diff. Do not paste your PR prose into it. Write for someone who will run the new version and wants to know what changed for them: lead with a present-tense verb (`Fixes`, `Adds`, `Updates`, `Removes`), describe the observable effect, and leave out internal mechanics (file names, refactors, how you implemented it). For a breaking change, include the migration step. One sentence is often enough.
+# Architecture
 
-When opening a PR with `gh`/the API, copy `.github/PULL_REQUEST_TEMPLATE.md` into the body and fill every section -- the GitHub UI injects it automatically but the CLI does not, and PRs missing it are auto-closed. Check the AI-generated code disclosure box and name the model. Tick checklist items only for what you actually verified; for test-only/docs/CI PRs, note why changeset/i18n/Discussion items are n/a.
+EmDash: Astro-native CMS on Cloudflare (D1 + R2 + Workers) or Node + SQLite.
 
-## Architecture
-
-EmDash is an Astro-native CMS on Cloudflare (D1 + R2 + Workers) or Node + SQLite.
-
-- **Schema in the database.** `_emdash_collections` and `_emdash_fields` are the source of truth. Each collection gets a real SQL table (`ec_posts`, `ec_products`) with typed columns -- not EAV.
-- **Middleware chain:** runtime init -> setup check -> auth -> request context (ALS). Auth middleware checks authentication only; routes check authorization.
-- **Handler layer** (`packages/core/src/api/handlers/*.ts`) holds business logic and returns `ApiResult<T>` (`{ success: true, data } | { success: false, error: { code, message, details? } }`). Route files are thin wrappers.
-- **Storage abstraction:** `Storage` interface with `upload/download/delete/exists/list/getSignedUploadUrl`. `LocalStorage` for dev, `S3Storage` for R2/AWS. Access via `emdash.storage` from locals.
+- **Schema in DB.** `_emdash_collections` + `_emdash_fields` are source of truth. Each collection → real SQL table (`ec_posts`) with typed columns, not EAV.
+- **Middleware chain:** runtime init → setup check → auth → request context (ALS). Auth middleware checks authentication only; routes check authorization.
+- **Handler layer** (`packages/core/src/api/handlers/*.ts`): business logic, returns `ApiResult<T>`. Routes are thin wrappers.
+- **Storage:** `Storage` interface (`upload/download/delete/exists/list/getSignedUploadUrl`). `LocalStorage` for dev, `S3Storage` for R2/AWS.
 
 Key files:
 
-| File                                              | Purpose                                               |
-| ------------------------------------------------- | ----------------------------------------------------- |
-| `packages/core/src/emdash-runtime.ts`             | Central runtime; orchestrates DB, plugins, storage    |
-| `packages/core/src/schema/registry.ts`            | Manages `ec_*` table creation/modification            |
+| File | Purpose |
+|---|---|
+| `packages/core/src/emdash-runtime.ts` | Central runtime; orchestrates DB, plugins, storage |
+| `packages/core/src/schema/registry.ts` | Manages `ec_*` table creation/modification |
 | `packages/core/src/database/migrations/runner.ts` | StaticMigrationProvider; register new migrations here |
-| `packages/core/src/plugins/manager.ts`            | Loads and orchestrates plugins                        |
+| `packages/core/src/plugins/manager.ts` | Loads and orchestrates plugins |
 
-# Code Patterns
+# Database
 
-## Database: Never Interpolate Into SQL
+Kysely is the query builder. **Never** interpolate into SQL.
 
-Kysely is the query builder.
-
-- **Never** use `sql.raw()` with string interpolation or template literals containing variables.
-- For **values**, use Kysely's `sql` tagged template -- interpolated values are automatically parameterized.
-- For **identifiers** (table/column names), use `sql.ref()`.
-- If you must use `sql.raw()` for dynamic identifiers, validate with `validateIdentifier()` from `database/validate.ts` first (asserts `/^[a-z][a-z0-9_]*$/`).
-- The `json_extract(data, '$.${field}')` pattern is particularly dangerous -- always validate `field`.
+- **Values:** Kysely `sql` tagged template (auto-parameterized).
+- **Identifiers:** `sql.ref()`.
+- If you must use `sql.raw()` for dynamic identifiers, validate with `validateIdentifier()` from `database/validate.ts` (`/^[a-z][a-z0-9_]*$/`).
+- `json_extract(data, '$.${field}')` — always validate `field`.
 
 ```typescript
-// WRONG -- SQL injection
+// WRONG
 const query = `SELECT * FROM ${table} WHERE name = '${name}'`;
 await sql.raw(query).execute(db);
 
-// RIGHT -- parameterized value, safe identifier
+// RIGHT — parameterized value, safe identifier
 await sql`SELECT * FROM ${sql.ref(table)} WHERE name = ${name}`.execute(db);
 
-// RIGHT -- validated identifier in raw SQL
+// RIGHT — validated identifier in raw SQL
 validateIdentifier(field);
 return sql.raw(`json_extract(data, '$.${field}')`);
 ```
 
-## API Routes
+**Migrations** live in `packages/core/src/database/migrations/`. Naming: `NNN_descriptive_name.ts`. Static imports in `runner.ts` + added to `getMigrations()` (not auto-discovered for Workers compat). Multi-table migrations: query `_emdash_collections` and loop (see `013_scheduled_publishing.ts`).
 
-Routes live in `packages/core/src/astro/routes/api/`. Conventions:
+**Index naming:** `idx_{table}_{column}` single-column, `idx_{table}_{purpose}` multi-column.
 
-- Every route file starts with `export const prerender = false;`.
-- Named exports: `export const GET: APIRoute`, etc. Destructure from the Astro context.
-- Access runtime via `const { emdash } = locals;`, user via `locals.user`.
-- File structure mirrors URLs: `content/[collection]/index.ts` for list/create, `[id].ts` for get/update/delete, sub-actions as siblings.
-- **Never** add GET handlers for state-changing operations.
+**Content tables:** `ec_{collection_slug}`. System tables: `_emdash_{name}`. Slugs: `/^[a-z][a-z0-9_]*$/`, max 63 chars, checked against `RESERVED_COLLECTION_SLUGS` / `RESERVED_FIELD_SLUGS`.
 
-Use the shared utilities -- don't roll your own:
+**Content localization:** row-per-locale (migration `019_i18n.ts`). Every `ec_*` table has `locale` (default `'en'`) and `translation_group` (ULID). `UNIQUE(slug, locale)`. Every query must filter by `locale`.
 
-| Need            | Use                                                                                      |
-| --------------- | ---------------------------------------------------------------------------------------- |
-| Error response  | `apiError(code, message, status)` from `#api/error.js`                                   |
-| Catch block     | `handleError(error, message, code)` -- never expose `error.message` to clients           |
-| Body validation | `parseBody(request, zodSchema)` from `#api/parse.js` -- never `as` cast `request.json()` |
-| Unwrap handler  | `unwrapResult(result)` -- maps error codes to HTTP statuses automatically                |
-| Init check      | `if (!emdash) return apiError("NOT_CONFIGURED", "EmDash is not initialized", 500);`      |
+# API Routes
 
-The error helper is `mapErrorStatus`, not `mapErrorToStatus`.
+Routes: `packages/core/src/astro/routes/api/`. Convention: `export const prerender = false;`. File structure mirrors URLs.
 
-### Authorization
+| Need | Use |
+|---|---|
+| Error response | `apiError(code, message, status)` from `#api/error.js` |
+| Catch block | `handleError(error, message, code)` — never expose `error.message` |
+| Body validation | `parseBody(request, zodSchema)` from `#api/parse.js` |
+| Unwrap handler | `unwrapResult(result)` — maps error codes via `mapErrorStatus` |
+| Init check | `if (!emdash) return apiError("NOT_CONFIGURED", "EmDash is not initialized", 500);` |
 
-Every state-changing route must check authorization. Authorization is permission-based, not role-based -- the `Permissions` map in `packages/auth/src/rbac.ts` is authoritative. Never invent permission strings in route files; add them to `rbac.ts` with a sensible minimum role.
+**Authorization** — permission-based, not role-based. `Permissions` map in `packages/auth/src/rbac.ts` is authoritative. Use `requirePerm(user, perm)` and `requireOwnerPerm(user, ownerId, ownPerm, anyPerm)` from `#api/authorize.js`. Both return `null` on success or a `Response`.
 
-```typescript
-import { requirePerm, requireOwnerPerm } from "#api/authorize.js";
+**CSRF:** All state-changing endpoints need `X-EmDash-Request: 1` header (enforced by auth middleware).
 
-// Any-actor capability (settings, schema)
-const denied = requirePerm(user, "schema:manage");
-if (denied) return denied;
+**Pagination:** `{ items, nextCursor? }` — never bare array. `encodeCursor`/`decodeCursor`. Default limit 50, max 100.
 
-// Ownership-aware (authors edit their own; editors edit anyone's)
-const denied = requireOwnerPerm(user, post.authorId, "content:edit_own", "content:edit_any");
-if (denied) return denied;
-```
-
-Both helpers return `null` on success or a `Response` (401/403) to return directly.
-
-### CSRF
-
-All state-changing endpoints require the `X-EmDash-Request: 1` header, enforced by auth middleware. The admin UI and visual editing client send it automatically.
-
-### Pagination
-
-List endpoints return `{ items, nextCursor? }` -- never a bare array. Use `encodeCursor(orderValue, id)` / `decodeCursor(cursor)`. Default limit 50, max 100, always clamp. The repository-level shape is `FindManyResult<T>`.
-
-### URL/Redirect handling
-
-When accepting redirect URLs from query params or bodies: require leading `/`, reject `//`, HTML-escape before interpolation, prefer `Response.redirect()` over `<meta http-equiv="refresh">`.
-
-## Handler Layer
-
-Handlers in `api/handlers/*.ts` are standalone async functions, not class methods.
-
-- First parameter is always `db: Kysely<Database>`, followed by route-specific params.
-- Return `ApiResult<T>`.
-- Wrap the body in try/catch. Errors return `{ success: false, error: { code, message } }`.
-- Error codes are `SCREAMING_SNAKE_CASE` (`NOT_FOUND`, `VALIDATION_ERROR`, `CONTENT_CREATE_ERROR`).
-
-## Migrations
-
-Migrations live in `packages/core/src/database/migrations/`.
-
-- **Naming:** `NNN_descriptive_name.ts`, zero-padded.
-- **Exports:** `up(db: Kysely<unknown>)` and `down(db: Kysely<unknown>)`.
-- **System tables:** Kysely schema builder.
-- **Dynamic content tables (`ec_*`):** `sql` tagged templates with `sql.ref()` for identifiers.
-- **Column types:** SQLite -- `text`, `integer`, `real`, `blob`. Booleans are `integer` defaulting to 0. Timestamps are `text` with ``defaultTo(sql`(datetime('now'))`)``. IDs are `text` primary keys (ULIDs from `ulidx`).
-- **Registration:** Migrations are statically imported in `runner.ts` and added to `StaticMigrationProvider`. Not auto-discovered (Workers bundler compatibility). When adding: create the file, add a static import in `runner.ts`, add it to `getMigrations()`.
-- **Multi-table migrations:** When altering all content tables, query `_emdash_collections` and loop. See `013_scheduled_publishing.ts`.
-
-## Indexes
-
-Every content table gets indexes on: `status`, `slug`, `created_at`, `deleted_at`, `scheduled_at` (partial, `WHERE scheduled_at IS NOT NULL`), `live_revision_id`, `draft_revision_id`, `author_id`, `primary_byline_id`, `updated_at`, `locale`, `translation_group`. Foreign key columns always get an index.
-
-Naming: `idx_{table}_{column}` for single-column, `idx_{table}_{purpose}` for multi-column.
-
-## Content Tables
-
-Managed by `SchemaRegistry` in `schema/registry.ts`:
-
-- **Names:** `ec_{collection_slug}`. System tables: `_emdash_{name}`.
-- **Slugs:** `/^[a-z][a-z0-9_]*$/`, max 63 chars, checked against `RESERVED_COLLECTION_SLUGS` / `RESERVED_FIELD_SLUGS`.
-- **Standard columns:** `id`, `slug`, `status`, `author_id`, `created_at`, `updated_at`, `published_at`, `scheduled_at`, `deleted_at`, `version`, `live_revision_id`, `draft_revision_id`. Field columns added via `ALTER TABLE`.
-- **Field type -> column mapping:** `FIELD_TYPE_TO_COLUMN` in `schema/types.ts`. Most string-shaped types -> TEXT; number -> REAL; integer/boolean -> INTEGER; portableText/json/multiSelect -> JSON.
-- **Orphan discovery:** `discoverOrphanedTables()` finds `ec_*` tables without a matching `_emdash_collections` row.
-
-## Content Localization
-
-Content tables use a row-per-locale model (migration `019_i18n.ts`):
-
-- Every `ec_*` table has `locale` (defaults to `'en'`) and `translation_group` (ULID shared across translations).
-- Slug uniqueness is `UNIQUE(slug, locale)`, not global.
-- Any new query against a content table must filter by `locale` -- forgetting this is a correctness bug.
-- Fetch all translations via `GET /_emdash/api/content/{collection}/{id}/translations`.
-
-When adding content-table features, ask: per-locale (display fields) or per-translation-group (anything identifying "the same thing" across languages)?
-
-## Performance: Caching and Query Patterns
-
-EmDash runs on D1 with the Sessions API. Anonymous reads go to the nearest replica; writes and authenticated reads route to the primary. Every round-trip matters.
-
-**Wrap query helpers in `requestCached`.** Per-request cache (`src/request-cache.ts`) dedupes identical calls within a render. If a helper takes stable args (slug, key, id) and may be called from multiple components, wrap it. The cache key must include every argument that changes the result. The promise is cached, so concurrent callers share the in-flight query.
-
-```typescript
-export function getSiteSetting(key: string) {
-	return requestCached(`siteSetting:${key}`, async () => {
-		const db = await getDb();
-		return ...;
-	});
-}
-```
-
-**Module-scope singletons must live on `globalThis`.** Vite duplicates modules across SSR chunks; a plain `let cache = null` becomes two variables. Use a `Symbol.for` key on `globalThis`. See `packages/core/src/settings/index.ts` (versioned) and `packages/core/src/request-context.ts` / `request-cache.ts` (per-request).
-
-**Prefer the batch query to a "has any" probe.** Don't add a `SELECT id FROM foo LIMIT 1` to skip work on empty sites -- on live sites you pay the extra query every request for no gain. Handle missing tables with `isMissingTableError`.
-
-**Defer bookkeeping with `after(fn)`.** Maintenance writes don't need to block TTFB. `after()` uses workerd's `waitUntil` when available, fire-and-forgets on Node. Wrap your function body in try/catch with a module-specific log prefix.
-
-```typescript
-import { after } from "emdash";
-
-after(async () => {
-	try {
-		await recoverStaleLocks();
-	} catch (error) {
-		console.error("[cron] recovery failed:", error);
-	}
-});
-```
-
-**One query beats two.** Use `LEFT JOIN` for parent+children. Batch with `WHERE id IN (...)`, chunked at `SQL_BATCH_SIZE` (from `utils/chunks.ts`) for D1's bind-parameter limit.
-
-**Query-count snapshots.** `pnpm query-counts` (see `scripts/query-counts.mjs`) records per-route query counts in `scripts/query-counts.snapshot.{sqlite,d1}.json`. CI auto-updates on PRs -- review the diff. Fewer is always right; more needs a conversation.
+**URL/redirect:** require leading `/`, reject `//`, HTML-escape before interpolation, prefer `Response.redirect()`.
 
 # Admin UI
 
-The admin (`packages/admin`) is a React SPA mounted under `/_emdash/admin/*`.
-
-## Kumo Components
-
-Built on [Kumo](https://github.com/cloudflare/kumo) (Cloudflare's design system). Never roll your own buttons, inputs, dialogs, etc. -- use Kumo. Get consistent styling, dark mode, accessibility, RTL for free.
-
-Look up docs from the CLI:
+React SPA at `packages/admin/`, mounted at `/_emdash/admin/*`. Uses [Kumo](https://github.com/cloudflare/kumo) design system — never roll your own components.
 
 ```bash
-npx @cloudflare/kumo doc Button   # specific component
-npx @cloudflare/kumo ls           # list all
+npx @cloudflare/kumo doc Button  # docs for any component
+npx @cloudflare/kumo ls          # list all components
 ```
+
+- `RouterLinkButton` wraps TanStack Router `<Link>` with Kumo styles. Never `<Link><Button>...</Button></Link>`.
+- Use semantic Kumo tokens (`bg-kumo-brand`), never raw Tailwind colors or `dark:` prefixes.
+- `ConfirmDialog`, `DialogError`, `getMutationError()` for dialogs.
+- Admin API client: use `throwResponseError()` from `lib/api/client.ts` — never `throw new Error("Failed to X")`.
+
+**Lingui** for all user-facing strings. Catalogs: `packages/admin/src/locales/{locale}/messages.po`. English source. Don't include `messages.po` changes in feature PRs — `pnpm locale:extract` runs on merge to main. Use `EMDASH_PSEUDO_LOCALE=1` in dev to spot leaks.
+
+```typescript
+// In components
+import { useLingui, Trans } from "@lingui/react/macro";
+const { t } = useLingui();           // inside component only
+return <button aria-label={t`Delete post`}>{t`Delete`}</button>;
+
+// Module scope — use msg, resolve with t() in component
+import { msg } from "@lingui/core/macro";
+const label = msg`Paragraph`;
+
+// Pluralization
+import { plural } from "@lingui/core/macro";
+const label = plural(count, { one: "# item", other: "# items" });
+```
+
+**RTL-safe Tailwind:** use `ms-*` / `me-*`, `ps-*` / `pe-*`, `start-*` / `end-*`, `text-start` / `text-end`, `border-s` / `border-e`, `rounded-s-*` / `rounded-e-*`. Flip directional icons with `rtl:-scale-x-100`. Test in Arabic before declaring done.
+
+# Performance
+
+- **`requestCached`** (`src/request-cache.ts`): dedupes identical calls within a render. Wrap helpers with stable args.
+- **Module-scope singletons** on `globalThis` with `Symbol.for` key (Vite duplicates modules across SSR chunks).
+- **`after(fn)`** for deferred bookkeeping. Uses workerd `waitUntil` when available, fire-and-forgets on Node.
+- **One query beats two.** `LEFT JOIN` for parent+children. Batch `WHERE id IN (...)` chunked at `SQL_BATCH_SIZE`.
+- **Query-count snapshots:** `pnpm query-counts` records per-route counts. CI auto-updates on PRs — review the diff.
+
+# Conventions
+
+- **Internal imports** use `.js` extensions (ESM). Type-only: `import type` (`verbatimModuleSyntax` on).
+- Virtual modules: `// @ts-ignore - virtual module`.
+- Barrel files: separate `export type { ... }` from value exports.
+- Use `import.meta.env.DEV` / `import.meta.env.PROD`, never `process.env.NODE_ENV`.
+- Secrets: `import.meta.env.EMDASH_X || import.meta.env.X || ""`.
+- Cloudflare `env` from `"cloudflare:workers"` virtual module. Don't manually type `Env` — run `pnpm wrangler types` to generate `worker-configuration.d.ts`. Local secrets in `.env` (not `.dev.vars`).
+
+# Testing
+
+- **Framework:** vitest. Tests in `packages/core/tests/` (unit, integration) and `e2e/tests/` (Playwright E2E).
+- **No DB mocks.** SQLite (`better-sqlite3`) by default. PostgreSQL via `EMDASH_TEST_PG` env var with per-test schema isolation.
+- **Test utilities:** `tests/utils/test-db.ts` — `setupTestDatabase()`, `setupTestDatabaseWithCollections()`, `teardownTestDatabase()`, `describeEachDialect()` for dialect-parametric suites.
+- **Browser tests:** `pnpm test:browser` (via Playwright component tests in `packages/admin`).
+- **Dev bypass** for auth-less browser testing: `GET /_emdash/api/setup/dev-bypass?redirect=/_emdash/admin` or `GET /_emdash/api/auth/dev-bypass?redirect=/_emdash/admin` (dev only).
+
+# Toolchain
+
+- **pnpm** v11 — package manager
+- **tsdown** — TypeScript builds (ESM + DTS)
+- **vitest** — testing
+- **oxfmt** — code formatting (tabs). Prettier for `.astro` files only.
+- **oxlint** — linting (strict, type-aware). `pnpm lint:quick` / `pnpm lint:json`.
+- **TypeScript:** target ES2024, module `preserve`, strict, `noUncheckedIndexedAccess`, `noImplicitOverride`, `verbatimModuleSyntax`.
+
+Repo scripts:
+
+| Command | What |
+|---|---|
+| `pnpm test` | All package unit/integration tests |
+| `pnpm test:unit` | Core + auth + blocks + related packages |
+| `pnpm test:browser` | Admin browser tests |
+| `pnpm test:e2e` | Playwright E2E (workers: 1, serial) |
+| `pnpm typecheck` | All packages |
+| `pnpm typecheck:demos` | Demo sites |
+| `pnpm typecheck:templates` | Template sites |
+| `pnpm build` | All packages |
+| `pnpm format` | oxfmt + prettier |
+| `pnpm lint:quick` | oxlint (json output, fast) |
+| `pnpm locale:extract` | Lingui catalog extraction |
+| `pnpm query-counts` | Per-route query count snapshots |
 
 Common imports: `Button`, `LinkButton`, `Dialog`, `Input`, `InputArea`, `Select`, `Checkbox`, `Switch`, `Loader`, `Badge`, `Toast`/`Toasty`, `Popover`, `Dropdown`, `Tooltip`, `Label`, `CommandPalette`.
 
